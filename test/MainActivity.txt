@@ -1,0 +1,301 @@
+package com.example.sensorreaderapp // Replace with your actual package name
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.Color
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import androidx.appcompat.app.AppCompatActivity
+import android.os.Bundle
+import android.util.Log
+import android.view.MotionEvent
+import android.widget.TextView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.switchmaterial.SwitchMaterial // Import SwitchMaterial
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.IOException
+import java.io.PrintWriter
+import java.net.InetAddress
+import java.net.Socket
+import java.net.SocketException
+import java.util.Locale
+
+// Constants for ADB communication
+private const val ADB_HOST = "127.0.0.1"
+private const val ADB_PORT = 6001 // Ensure this port matches adb forward and python script
+
+class MainActivity : AppCompatActivity(), SensorEventListener {
+
+    // Sensor management
+    private lateinit var sensorManager: SensorManager
+    private var accelerometer: Sensor? = null
+    private var gyroscope: Sensor? = null // ADD Gyroscope sensor variable
+
+    // UI Elements
+    private lateinit var accelXValueTextView: TextView
+    private lateinit var accelYValueTextView: TextView
+    private lateinit var accelZValueTextView: TextView
+    private lateinit var gyroZValueTextView: TextView // ADD Gyroscope Y value TextView
+    private lateinit var statusTextView: TextView
+    private lateinit var reverseSwitch: SwitchMaterial
+    private lateinit var accelerateButton: MaterialButton
+    private lateinit var brakeButton: MaterialButton
+
+    // Button states
+    private var isAcceleratePressed = false
+    private var isBrakePressed = false
+
+    // Latest sensor data
+    private var lastAccelerometerData = FloatArray(3) { 0.0f }
+    private var lastGyroscopeData = FloatArray(3) { 0.0f } // ADD Gyroscope data storage
+    private var lastReverseState: Int = 0
+
+    // Network components
+    private var clientSocket: Socket? = null
+    private var printWriter: PrintWriter? = null
+    private var connectionJob: Job? = null
+
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main) // Use the layout with the switch
+
+        // --- Initialize UI Elements ---
+        accelXValueTextView = findViewById(R.id.accelXValueTextView) // Keep for potential future use
+        accelYValueTextView = findViewById(R.id.accelYValueTextView)
+        accelZValueTextView = findViewById(R.id.accelZValueTextView) // Keep for potential future use
+        gyroZValueTextView = findViewById(R.id.gyroZValueTextView) // Initialize Gyro TextView
+        statusTextView = findViewById(R.id.statusTextView)
+        reverseSwitch = findViewById(R.id.reverseSwitch)
+        accelerateButton = findViewById(R.id.accelerateButton)
+        brakeButton = findViewById(R.id.brakeButton)
+        // --- End UI Initialization ---
+
+        // Touch listeners for buttons remain the same
+        accelerateButton.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    isAcceleratePressed = true
+                    sendCurrentState()
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    isAcceleratePressed = false
+                    sendCurrentState()
+                    true
+                }
+                else -> false
+            }
+        }
+
+        brakeButton.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    isBrakePressed = true
+                    sendCurrentState()
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    isBrakePressed = false
+                    sendCurrentState()
+                    true
+                }
+                else -> false
+            }
+        }
+
+        // --- Sensor Initialization ---
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE) // Get Gyroscope Sensor
+
+        if (accelerometer == null) Log.e("SensorError", "Accelerometer not available.")
+        if (gyroscope == null) Log.e("SensorError", "Gyroscope not available.") // Add Gyroscope check
+
+        // Reverse switch listener remains the same
+        reverseSwitch.setOnCheckedChangeListener { _, isChecked ->
+            lastReverseState = if (isChecked) 1 else 0
+            sendCurrentState()
+        }
+        lastReverseState = if (reverseSwitch.isChecked) 1 else 0
+
+        updateUI() // Initial UI update
+    }
+
+
+    override fun onResume() {
+        super.onResume()
+        // Register listeners for both sensors
+        accelerometer?.also { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        gyroscope?.also { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) } // Register Gyroscope listener
+        Log.i("SensorLifecycle", "Sensor listeners registered.")
+        connectToServer()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        sensorManager.unregisterListener(this) // Unregisters all listeners for this context
+        Log.i("SensorLifecycle", "Sensor listeners unregistered.")
+        disconnectFromServer()
+    }
+
+    // --- Connection Management (No changes needed) ---
+    private fun connectToServer() {
+        connectionJob?.cancel()
+        connectionJob = lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) { updateStatus("Connecting...") }
+                Log.i("NetworkTCP", "Attempting to connect to $ADB_HOST:$ADB_PORT...")
+                clientSocket?.close()
+                clientSocket = Socket(ADB_HOST, ADB_PORT)
+                printWriter = PrintWriter(clientSocket!!.getOutputStream(), true)
+                Log.i("NetworkTCP", "TCP Connection established successfully.")
+                withContext(Dispatchers.Main) { updateStatus("Connected") }
+                sendCurrentState()
+            } catch (e: IOException) {
+                Log.e("NetworkTCP", "Connection failed: ${e.message}", e)
+                withContext(Dispatchers.Main) { updateStatus("Connection Failed") }
+                clientSocket = null
+                printWriter = null
+            } catch (e: Exception) {
+                Log.e("NetworkTCP", "Unexpected error during connection: ${e.message}", e)
+                withContext(Dispatchers.Main) { updateStatus("Error") }
+                clientSocket = null
+                printWriter = null
+            }
+        }
+    }
+
+    private fun disconnectFromServer() {
+        connectionJob?.cancel()
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                printWriter?.close()
+                clientSocket?.close()
+                Log.i("NetworkTCP", "TCP Connection closed.")
+            } catch (e: IOException) {
+                Log.e("NetworkTCP", "Error closing socket: ${e.message}", e)
+            } finally {
+                printWriter = null
+                clientSocket = null
+                withContext(Dispatchers.Main) {
+                    updateStatus("Disconnected")
+                }
+            }
+        }
+    }
+
+    // --- Sensor Event Handling ---
+    override fun onSensorChanged(event: SensorEvent?) {
+        if (event == null) return
+
+        var accelYChanged = false // Track only accel Y changes for sending data for now
+        when (event.sensor.type) {
+            Sensor.TYPE_ACCELEROMETER -> {
+                // Check if 'ay' changed significantly
+                if (Math.abs(lastAccelerometerData[1] - event.values[1]) > 0.01) {
+                    accelYChanged = true
+                }
+                // Always update the stored data for UI display
+                lastAccelerometerData = event.values.clone()
+            }
+            Sensor.TYPE_GYROSCOPE -> { // ADD Gyroscope case
+                // Always update stored data for UI display
+                lastGyroscopeData = event.values.clone()
+                // NOTE: We are NOT setting accelYChanged = true here yet.
+                // Sending gyro data will be handled in a later step if needed.
+            }
+        }
+
+        updateUI() // Update UI with latest data from both sensors
+
+        // Send data ONLY if the relevant accelerometer data (ay) changed significantly.
+        // Button changes trigger sends via their own listeners.
+        // Gyroscope changes currently DO NOT trigger a send.
+        if (accelYChanged) {
+            sendCurrentState()
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) { /* Optional log */ }
+
+    // --- Data Sending (No changes needed here for now) ---
+    // sendCurrentState and sendDataOverTCP remain unchanged,
+    // still sending only accelData[1] (ay), button states, and reverse state.
+    private fun sendCurrentState() {
+        if (clientSocket?.isConnected == true && printWriter != null) {
+            sendDataOverTCP(lastAccelerometerData, isAcceleratePressed, isBrakePressed, lastReverseState)
+        }
+    }
+
+    private fun sendDataOverTCP(accelData: FloatArray, accelState: Boolean, brakeState: Boolean, reverseState: Int) {
+        val writer = printWriter
+        if (writer == null || clientSocket?.isConnected != true) return
+
+        val accelInt = if (accelState) 1 else 0
+        val brakeInt = if (brakeState) 1 else 0
+
+        // Still sending: ay, accel_state, brake_state, reverse_state
+        val messageStr = String.format(Locale.US, "%.4f,%d,%d,%d",
+            accelData[1], // Send 'ay'
+            accelInt,
+            brakeInt,
+            reverseState)
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                writer.println(messageStr)
+                if (writer.checkError()) {
+                    Log.e("NetworkTCP", "PrintWriter error occurred during send.")
+                    withContext(Dispatchers.Main) { updateStatus("Send Error - Reconnecting...") }
+                    disconnectFromServer()
+                    kotlinx.coroutines.delay(500)
+                    connectToServer()
+                }
+            } catch (e: Exception) {
+                Log.e("NetworkTCP", "Error sending TCP data: ${e.message}", e)
+                withContext(Dispatchers.Main) { updateStatus("Send Error") }
+                disconnectFromServer()
+                kotlinx.coroutines.delay(500)
+                connectToServer()
+            }
+        }
+    }
+
+    // --- UI Update ---
+    private fun updateUI() {
+        // Update Accelerometer Y display
+        // accelXValueTextView.text = String.format(Locale.US, "%+6.2f", lastAccelerometerData[0]) // Keep if visible
+        accelYValueTextView.text = String.format(Locale.US, "%+6.2f", lastAccelerometerData[1])
+        // accelZValueTextView.text = String.format(Locale.US, "%+6.2f", lastAccelerometerData[2]) // Keep if visible
+
+        // Update Gyroscope Z display
+        gyroZValueTextView.text = String.format(Locale.US, "%+6.2f", lastGyroscopeData[2]) // Display Gyro Z (index 1)
+
+        updateStatus(null)
+    }
+
+    // updateStatus function remains the same
+    private fun updateStatus(newStatusText: String?) {
+        val currentStatusText = when {
+            newStatusText != null -> "Status: $newStatusText"
+            connectionJob?.isActive == true -> "Status: Connecting..."
+            clientSocket?.isConnected == true -> "Status: Connected"
+            else -> "Status: Disconnected"
+        }
+        statusTextView.text = currentStatusText
+        val colorRes = when {
+            currentStatusText.contains("Connected") -> android.R.color.holo_green_dark
+            currentStatusText.contains("Connecting") || currentStatusText.contains("Reconnecting") -> android.R.color.holo_orange_light
+            else -> android.R.color.holo_red_dark
+        }
+        statusTextView.setTextColor(ContextCompat.getColor(this, colorRes))
+    }
+}
