@@ -176,13 +176,14 @@ def main():
 
         settings = world.get_settings()
         if not args.asynch:
-            traffic_manager.set_synchronous_mode(True)
-            if not settings.synchronous_mode:
-                synchronous_master = True
-                settings.synchronous_mode = True
-                settings.fixed_delta_seconds = 0.03
-            else:
-                synchronous_master = False
+            # traffic_manager.set_synchronous_mode(True)
+            # if not settings.synchronous_mode:
+            #     synchronous_master = True
+            #     settings.synchronous_mode = True
+            #     settings.fixed_delta_seconds = 0.03
+            # else:
+            #     synchronous_master = False
+            pass
         else:
             print("You are currently in asynchronous mode. If this is a traffic simulation, \
             you could experience some issues. If it's not working correctly, switch to synchronous \
@@ -343,7 +344,7 @@ def main():
 
         while True:
             if not args.asynch and synchronous_master:
-                world.tick()
+                world.tick() 
             else:
                 world.wait_for_tick()
 
