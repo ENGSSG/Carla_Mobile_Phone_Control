@@ -29,7 +29,10 @@ import threading
 import time
 import sys
 import traceback
-from mpc_controller import MPCController
+import multiprocessing
+from mpc_controller import MPCProcess
+
+
 try:
     import pygame
     # ... (Keep all necessary pygame imports) ...
@@ -86,8 +89,7 @@ def get_actor_blueprints(world, filter, generation):
     except:
         print("   Warning! Actor Generation is not valid. No actor will be spawned.")
         return []
-# Inside SensorControl.__init__ or globally before game_loop
-mpc = MPCController(horizon_N=10, dt=0.05) # Adjust dt based on your CARLA fixed_delta_seconds if using sync mode
+
 
 # ==============================================================================
 # -- World ---------------------------------------------------------------------
@@ -284,58 +286,14 @@ class SensorControl(object):
     - Uses keyboard for auxiliary actions (HUD, camera, lights, etc.).
     - Manages its own background thread for receiving sensor data.
     """
-    def __init__(self, world, start_in_autopilot, tcp_host="127.0.0.1", tcp_port=6001):
+    def __init__(self, world, start_in_autopilot,  mpc_conn_send, mpc_conn_recv):
         self._world_ref = weakref.ref(world)
         self._autopilot_enabled = start_in_autopilot
         self._control = carla.VehicleControl()
         self._lights = carla.VehicleLightState.NONE
-        self._steer_cache = 0.0
-        self._throttle_cache = 0.0
-        self._brake_cache = 0.0
-
-        # --- Internal Sensor Data Storage ---
-        # self.accelerometer_data = (0.0, 0.0, 0.0) # ax, ay, az
-        self.ay_data = 0.0 # Store ay separately
-        self.gz_data = 0.0
-        self.accelerate_pressed = 0 # Store button state (0 or 1)
-        self.brake_pressed = 0      # Store button state (0 or 1)
-        self.reverse_enabled = False # Keep this for the reverse switch
-        self._data_lock = threading.Lock()
-        self._last_update_time = time.time()
-        self._is_connected = False
-        self.client_conn = None
-        
-        # --- Control Parameters (Tune These!) ---
-        # Steering Angle (using ay)
-        self.steer_angle_sensitivity = 0.5  # Adjust sensitivity for ay (likely needs less than gyro)
-        self.steering_angle_deadzone = 0.5  # Deadzone around ay=0 m/s^2
-        self.max_vehicle_steer_angle_deg = 70
-
-        # Steering Rate (using gz)
-        self.steer_rate_sensitivity = 0.8 # rad/s of target rate per rad/s of gz (TUNE)
-        self.steering_rate_deadzone = 0.1 # Deadzone for gz (rad/s) (TUNE)
-        self.max_vehicle_steer_rate_rps = np.radians(90.0) # Max target rate (rad/s) (TUNE)
-        
-        # Optional: Add smoothing cache variables if needed later
-        # self._desired_steer_angle_cache = 0.0
-        # self._desired_steer_rate_cache = 0.0
-
-        # Smoothing
-        self.smoothing_factor = 0.1 # Lower value = smoother but more lag
-
-        # Speed Limit
-        self.max_speed_kph = 30.0
-        # -----------------------------------------
-
-        # --- TCP Listener Setup ---
-        self._tcp_host = tcp_host
-        self._tcp_port = tcp_port
-        self._buffer_size = 1024
-        self._running_flag = threading.Event()
-        self._running_flag.set()
-        self._listener_thread = threading.Thread(target=self._run_sensor_listener, daemon=True)
-        self._listener_thread.start()
-        print(f"SensorControl: Listener thread started on {self._tcp_host}:{self._tcp_port}")
+                # IPC Pipes
+        self.mpc_vehicle_data_pipe_send = mpc_conn_send
+        self.mpc_control_cmd_pipe_recv = mpc_conn_recv
 
         # Initialize player state
         world_instance = self._get_world()
@@ -508,52 +466,6 @@ class SensorControl(object):
             print("SensorControl Listener: Server socket closed.")
         self.client_conn = None
 
-    # def _convert_sensor_to_control(self, ay_data, accel_state, brake_state):
-
-    #     # Ensure input data is valid
-    #     # if not (isinstance(accelerometer_data, (list, tuple)) and len(accelerometer_data) == 3):
-    #     #     print("Warning: Invalid accelerometer data received.")
-    #     #     return {'throttle': 0.0, 'steer': 0.0, 'brake': 0.0, 'reverse': self._control.reverse} # Return last known state
-
-    #     # accel_x, accel_y, accel_z = accelerometer_data
-        
-    #     # --- Steering Calculation (using ay) ---
-    #     # Apply deadzone
-    #     raw_steer_input = ay_data
-    #     steer = 0.0
-    #     if abs(raw_steer_input) > self.steering_deadzone:
-    #         max_ay = 9.8
-    #         scale_factor = max(0.001, max_ay - self.steering_deadzone)
-    #         scaled_input = (abs(raw_steer_input) - self.steering_deadzone) / scale_factor
-    #         steer = math.copysign(scaled_input, raw_steer_input) * self.steer_sensitivity
-    #     steer = max(-1.0, min(steer, 1.0))
-
-    #      # Clamp to [-1, 1]
-
-    #     throttle = 1.0 if accel_state==1 else 0.0
-    #     brake = 1.0 if brake_state==1 else 0.0
-
-    #     # if brake > 0.0:
-    #     #     throttle = 0.0
-
-    
-
-    #     # --- Smoothing ---
-    #     smooth_steer = self.smoothing_factor * self._steer_cache + (1.0 - self.smoothing_factor) * steer
-    #     smooth_throttle = self.smoothing_factor * self._throttle_cache + (1.0 - self.smoothing_factor) * throttle
-    #     smooth_brake = self.smoothing_factor * self._brake_cache + (1.0 - self.smoothing_factor) * brake
-
-    #     # --- Update Cache ---
-    #     self._steer_cache = smooth_steer
-    #     self._throttle_cache = smooth_throttle
-    #     self._brake_cache = smooth_brake
-
-    #     # --- Return Control Values ---
-    #     # Reverse is handled directly from the received state in parse_events
-    #     return {'steer': round(smooth_steer, 5),
-    #             'throttle': round(smooth_throttle, 5),                
-    #             'brake': round(smooth_brake, 5)}
-
 
     def parse_events(self, client, world, clock, sync_mode):
         """
@@ -561,253 +473,108 @@ class SensorControl(object):
         and applies controls to the player vehicle. Includes speed limit.
         """
         world_instance = self._get_world()
-        if not world_instance or not self._control:
-            # Still process quit events even if world/control is invalid
+        if not world_instance or not self._control or not world_instance.player or not world_instance.player.is_alive:
+            # Handle quit events even if world/control is invalid
             for event in pygame.event.get():
                 if event.type == pygame.QUIT or (event.type == pygame.KEYUP and self._is_quit_shortcut(event.key)): return True
-            return False # Cannot control if world/control invalid
-
-        player = world_instance.player
-        # --- Define Haptic Thresholds (Tune these!) ---
-        COLLISION_INTENSITY_THRESHOLD = 0.5 # Adjust based on desired sensitivity
-        ACCEL_THRESHOLD = 5.0 # m/s^2 # Adjust based on desired sensitivity
-        BRAKE_THRESHOLD = 5.0 # m/s^2 # Adjust based on desired sensitivity
-
-        haptic_trigger_message = None # Initialize message for this frame
-
-        # --- Get Vehicle Data for Haptics ---
-        try:
-            # 1. Acceleration Data
-            vehicle_accel = player.get_acceleration() # Returns carla.Vector3D [cite: 2]
-            accel_magnitude = np.sqrt(vehicle_accel.x**2 + vehicle_accel.y**2 + vehicle_accel.z**2) # Use numpy for magnitude
-
-            # Check for strong acceleration/braking
-            # Optional: Compare with velocity vector to distinguish accel/brake more accurately
-            # vel = player.get_velocity()
-            # direction_dot = vehicle_accel.x * vel.x + vehicle_accel.y * vel.y + vehicle_accel.z * vel.z
-            if accel_magnitude > ACCEL_THRESHOLD: # Simplified check for now
-                 # Basic trigger for significant acceleration/braking
-                 # You could send different messages for accel vs brake if needed
-                 haptic_trigger_message = f"FORCE,{np.clip(accel_magnitude / 20.0, 0, 1):.2f}\n" # Send magnitude normalized (0-1, scaled)
-
-            # 2. Collision Data
-            if world_instance.collision_sensor: # Check if sensor exists
-                collision_history = world_instance.collision_sensor.get_collision_history()
-                # Get collisions from the current frame (or maybe last few frames)
-                current_frame = world_instance.hud.frame # Get current frame number
-                intensity = collision_history.get(current_frame, 0.0) # Intensity for this frame
-                # You might want to check a small window, e.g., current_frame-1, current_frame-2
-                # max_intensity_recent = max(collision_history.get(f, 0.0) for f in range(current_frame - 2, current_frame + 1))
-
-                if intensity > COLLISION_INTENSITY_THRESHOLD:
-                    # Collision detected, send normalized intensity (0-1)
-                    # Normalize based on expected range or a fixed large value
-                    normalized_intensity = min(intensity / 5000.0, 1.0) # Adjust 5000 based on tests
-                    haptic_trigger_message = f"COLLISION,{normalized_intensity:.2f}\n"
-
-        except Exception as e:
-            print(f"SensorControl: Error getting vehicle data for haptics: {e}")
-
-
-        # Check if player exists and is alive before proceeding
-        if not player or not player.is_alive:
-             # If player is dead/gone, still handle quit events and maybe restart
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT or (event.type == pygame.KEYUP and self._is_quit_shortcut(event.key)): return True
-                elif event.type == pygame.KEYUP and event.key == K_BACKSPACE: # Allow restart
-                    print("Player not alive. Restarting...")
-                    if self._autopilot_enabled: player.set_autopilot(False); world_instance.restart(); player = world_instance.player; player.set_autopilot(True)
-                    else: world_instance.restart(); player = world_instance.player
-                    # Re-initialize control state after restart
-                    self._control = carla.VehicleControl(); self._lights = carla.VehicleLightState.NONE
-                    if player and isinstance(player, carla.Vehicle): player.apply_control(self._control); player.set_light_state(self._lights); player.set_autopilot(self._autopilot_enabled)
-                    return False # Continue after restart
-            return False # Cannot control if player is dead/gone
+            return False
         
-        # --- Get Sensor Data ---
-        # *** Get gz_data ***
-        ay_raw, gz_raw, accel_pressed, brake_pressed, reverse_active, is_connected = self._get_sensor_data()
-            # --- Handle Disconnection ---
-        if not is_connected or time.time() - self._last_update_time > 2.0:
-            # ... (existing disconnect logic) ...
-            desired_steer_angle_rad = 0.0
-            desired_steer_rate_rps = 0.0 # *** ADD reset for rate ***
-            # ... (rest of disconnect logic) ...
-        else:
-            # --- Calculate Desired Angle from AY ---
-            desired_steer_angle_rad = 0.0
-            if abs(ay_raw) > self.steering_angle_deadzone:
-                max_ay_for_scaling = 9.8 # TUNE
-                scale_factor = max(0.001, max_ay_for_scaling - self.steering_angle_deadzone)
-                scaled_input = (abs(ay_raw) - self.steering_angle_deadzone) / scale_factor
-                # *** TUNE THE SIGN of -ay_raw based on your phone orientation ***
-                target_angle_deg = math.copysign(scaled_input, ay_raw) * self.steer_angle_sensitivity * self.max_vehicle_steer_angle_deg
-                desired_steer_angle_rad = np.radians(np.clip(target_angle_deg, -self.max_vehicle_steer_angle_deg, self.max_vehicle_steer_angle_deg))
+        player = world_instance.player
+        
+        # --- Get Vehicle Data for MPC and Haptics ---
+        transform = player.get_transform()
+        velocity = player.get_velocity()
+        physics_control = player.get_physics_control()
+        current_steer_angle_rad = 0.0
+        try:
+            current_steer_angle_rad = np.radians(player.get_wheel_steer_angle(carla.VehicleWheelLocation.FL_Wheel))
+        except Exception as e:
+            print(f"Android_control: Warning: Could not get wheel steer angle: {e}. Using 0.")
 
-            # --- Calculate Desired Rate from GZ ---
-            desired_steer_rate_rps = 0.0
-            if abs(gz_raw) > self.steering_rate_deadzone:
-                max_gz_for_scaling = 5.0 # Radians/sec (TUNE)
-                scale_factor = max(0.001, max_gz_for_scaling - self.steering_rate_deadzone)
-                scaled_input = (abs(gz_raw) - self.steering_rate_deadzone) / scale_factor
-                # *** TUNE THE SIGN of -gz_raw based on your phone orientation ***
-                desired_steer_rate_rps = math.copysign(scaled_input, -gz_raw) * self.steer_rate_sensitivity * self.max_vehicle_steer_rate_rps
-                desired_steer_rate_rps = np.clip(desired_steer_rate_rps, -self.max_vehicle_steer_rate_rps, self.max_vehicle_steer_rate_rps)
+        current_location = transform.location
+        current_rotation = transform.rotation
+        current_speed_mps = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
 
-            # --- Smoothing (Optional) ---
-            # smoothed_angle_rad = ... (apply smoothing if desired)
-            # smoothed_rate_rps = ... (apply smoothing if desired)
-            smoothed_angle_rad = desired_steer_angle_rad # Use raw if MPC handles smoothing
-            smoothed_rate_rps = desired_steer_rate_rps   # Use raw if MPC handles smoothing
-            # --- Get Current Vehicle State for MPC ---
-            transform = player.get_transform()
-            velocity = player.get_velocity()
-            physics_control = player.get_physics_control() # Get physics control
+        current_vehicle_state = np.array([
+            current_location.x,
+            current_location.y,
+            np.radians(current_rotation.yaw),
+            current_speed_mps,
+            current_steer_angle_rad
+        ])
 
+        # --- Haptic-related data ---
+        collision_intensity_for_haptics = 0.0
+        if world_instance.collision_sensor:
+            collision_history = world_instance.collision_sensor.get_collision_history()
+            current_frame_num = world_instance.hud.frame # Ensure hud.frame is updated
+            collision_intensity_for_haptics = collision_history.get(current_frame_num, 0.0)
+
+        vehicle_accel_for_haptics = player.get_acceleration()
+        accel_magnitude_for_haptics = np.sqrt(vehicle_accel_for_haptics.x**2 + vehicle_accel_for_haptics.y**2 + vehicle_accel_for_haptics.z**2)
+
+
+        # --- Send Vehicle Data to MPC Process ---
+        data_to_mpc = {
+            'state': current_vehicle_state,
+            'collision_intensity': collision_intensity_for_haptics, # Send for haptics
+            'accel_magnitude': accel_magnitude_for_haptics      # Send for haptics
+        }
+        try:
+            if self.mpc_vehicle_data_pipe_send:
+                 self.mpc_vehicle_data_pipe_send.send(data_to_mpc)
+        except Exception as e:
+            print(f"Android_control: Error sending data to MPC: {e}")
+
+
+        # --- Receive Control Command from MPC Process ---
+        # Use poll for non-blocking receive with a timeout
+        if self.mpc_control_cmd_pipe_recv and self.mpc_control_cmd_pipe_recv.poll(timeout=0.005): # Short timeout
             try:
-                # *** Get actual steering angle in RADIANS ***
-                current_steer_angle_rad = np.radians(player.get_wheel_steer_angle(carla.VehicleWheelLocation.FL_Wheel))
+                mpc_command = self.mpc_control_cmd_pipe_recv.recv()
+                if mpc_command:
+                    # --- Apply MPC Command ---
+                    optimal_steer_angle_cmd_rad = mpc_command.get('steer_angle_rad', 0.0)
+                    self._control.throttle = mpc_command.get('throttle', 0.0)
+                    self._control.brake = mpc_command.get('brake', 0.0)
+                    self._control.reverse = mpc_command.get('reverse', False)
+
+                    # Convert optimal angle command (radians) back to normalized CARLA input [-1, 1]
+                    max_phys_steer_angle_rad = np.radians(70.0) # Fallback
+                    try:
+                        max_phys_steer_angle_deg_val = physics_control.wheels[0].max_steer_angle
+                        max_phys_steer_angle_rad = np.radians(max_phys_steer_angle_deg_val)
+                    except (AttributeError, IndexError) as e:
+                        print(f"Android_control: Warning getting max steer angle: {e}. Using default.")
+
+                    if max_phys_steer_angle_rad > 1e-4:
+                        self._control.steer = np.clip(optimal_steer_angle_cmd_rad / max_phys_steer_angle_rad, -1.0, 1.0)
+                    else:
+                        self._control.steer = 0.0
+            except EOFError:
+                print("Android_control: MPC control pipe closed.")
             except Exception as e:
-                print(f"Warning: Could not get wheel steer angle: {e}. Using 0.")
-                current_steer_angle_rad = 0.0
-
-            current_location = transform.location
-            current_rotation = transform.rotation
-            current_speed_mps = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
-
-            current_state = np.array([
-                current_location.x,
-                current_location.y,
-                np.radians(current_rotation.yaw),
-                current_speed_mps,
-                current_steer_angle_rad # *** Use actual angle in radians ***
-            ])
-            # --- Call MPC ---
-            # *** Pass both desired angle and rate to MPC (MPC needs modification) ***
-            optimal_steer_output_value = mpc.compute_steering_command(current_state, smoothed_rate_rps, smoothed_angle_rad)
-
-            # --- Interpret MPC Output ---
-            # *** ASSUMPTION: Modified MPC now returns optimal STEERING ANGLE in radians ***
-            optimal_steer_angle_cmd_rad = optimal_steer_output_value
-
-            # Convert optimal angle command (radians) back to normalized CARLA input [-1, 1]
-            try:
-                # Get max steer angle from the *actual* front left wheel physics
-                max_phys_steer_angle_deg = physics_control.wheels[0].max_steer_angle
-                max_phys_steer_angle_rad = np.radians(max_phys_steer_angle_deg)
-            except (AttributeError, IndexError): # Handle cases where physics_control or wheels might be missing/empty
-                print("Warning: Could not get max steer angle from physics. Using default.")
-                max_phys_steer_angle_rad = np.radians(70.0) # Fallback
-
-            if max_phys_steer_angle_rad > 1e-4: # Avoid division by zero
-                normalized_steer_cmd = np.clip(optimal_steer_angle_cmd_rad / max_phys_steer_angle_rad, -1.0, 1.0)
-            else:
-                normalized_steer_cmd = 0.0
-
-            # --- Update Control Object ---
-            self._control.steer = normalized_steer_cmd # *** Use MPC output ***
-            self._control.throttle = 1.0 if accel_pressed == 1 else 0.0
-            self._control.brake = 1.0 if brake_pressed == 1 else 0.0
-            self._control.reverse = reverse_active
-#-----------------------------------------------------------------------------------------------------------------------
-        # Inside parse_events loop, before applying control
-        # if world and world.player and world.player.is_alive:
-        #     player = world.player
-        #     transform = player.get_transform()
-        #     velocity = player.get_velocity()
-        #     control_status = player.get_control() # Get last applied control
-
-        #     current_location = transform.location
-        #     current_rotation = transform.rotation
-        #     current_speed_mps = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
-        #     current_steer_angle = player.get_wheel_steer_angle # Note: This is normalized [-1, 1]. MPC needs actual angle.
-        #     # You might need to get the actual physics steering angle if available/needed by your model.
-        #     # Example: Get from physics control if applied, or estimate based on max steer angle.
-        #     # This part requires care depending on your chosen vehicle model state representation.
-
-        #     # Placeholder state vector - ADAPT THIS TO YOUR VEHICLE MODEL
-        #     # [x, y, yaw (radians), velocity (m/s), steering_angle (radians)]
-        #     # Need to map CARLA coords/angles to your model's convention
-        #     current_state = np.array([
-        #         current_location.x,
-        #         current_location.y,
-        #         np.radians(current_rotation.yaw),
-        #         current_speed_mps,
-        #         current_steer_angle # Estimate actual angle
-        #     ])
-
-        #     # Get desired steer rate from phone tilt (ay_data)
-        #     # You already have ay_data from self._get_sensor_data()
-        #     # Apply mapping/sensitivity from phone tilt 'ay' to a desired steering rate (rad/s)
-        #     raw_steer_input = self.ay_data # From phone
-        #     desired_steer_rate_from_phone = 0.0
-        #     # Apply deadzone and sensitivity (similar to your existing _convert_sensor_to_control)
-        #     # Ensure this output is in radians per second if your MPC expects rate
-        #      # Example deadzone for ay
-        #      # Example sensitivity (tune this!)
-        #     max_ay_for_scaling = 9.0 # Assume max relevant tilt gives this ay value
-        #     if abs(raw_steer_input) > self.steering_deadzone:
-        #         scale_factor = max(0.01, max_ay_for_scaling - self.steering_deadzone)
-        #         scaled_input = (abs(raw_steer_input) - self.steering_deadzone) / scale_factor
-        #         # Map scaled input [-1, 1] to a desired rate [rad/s]
-        #         # Max desired rate could be linked to self.max_steer_rate
-        #         desired_steer_rate_from_phone = math.copysign(scaled_input, raw_steer_input) * mpc.max_steer_rate * self.steer_sensitivity # Example mapping
+                print(f"Android_control: Error receiving/processing control from MPC: {e}")
+                # Fallback: Zero out controls if MPC comm fails
+                self._control.steer = 0.0
+                self._control.throttle = 0.0
+                self._control.brake = 0.5 # Apply some brake
+        # else:
+            # Optional: If no command received, maintain last control or apply a default
+            # print("Android_control: No command from MPC this tick.")
+            # pass
 
 
-        #     # Call MPC
-        #     optimal_steer_rate_cmd = mpc.compute_steering_command(current_state, desired_steer_rate_from_phone)
-
-        #     # --- Apply Controls ---
-        #     # Update self._control object
-        #     # MPC gives optimal *rate*, but VehicleControl takes normalized steer *angle* [-1, 1]
-        #     # Need to integrate the rate command or map it appropriately.
-        #     # Simplistic approach: Apply a steer value proportional to the optimal rate?
-        #     # Or, better: Have MPC output the target steer *angle* directly?
-        #     # Let's assume MPC calculates the target steer *angle* for simplicity here
-        #     # (modify MPC output/cost function accordingly)
-
-        #     # Placeholder: Assuming MPC now gives target steer angle command [-max_angle, +max_angle] in radians
-        #     optimal_steer_angle_cmd_rad = optimal_steer_rate_cmd # **REPLACE WITH ACTUAL MPC OUTPUT**
-
-        #     # Convert optimal angle command (radians) back to normalized CARLA input [-1, 1]
-        #     max_phys_steer_angle_rad = np.radians(world.player.get_physics_control().wheels[0].max_steer_angle)
-        #     if max_phys_steer_angle_rad > 1e-4: # Avoid division by zero
-        #         normalized_steer_cmd = np.clip(optimal_steer_angle_cmd_rad / max_phys_steer_angle_rad, -1.0, 1.0)
-        #     else:
-        #         normalized_steer_cmd = 0.0
-
-        #     # Use the MPC output for steering
-        #     self._control.steer = normalized_steer_cmd
-
-        #     # Throttle/Brake still comes from buttons
-        #     # self._control.throttle = 1.0 if accel_pressed == 1 else 0.0
-        #     # self._control.brake = 1.0 if brake_pressed == 1 else 0.0
-        #     # self._control.reverse = reverse_active # From phone switch
-
-        #     # Apply the combined control
-        #     if not self._autopilot_enabled:
-        #         player.apply_control(self._control)
-        #         # ... (rest of light update logic) ...
-
-
-        # --- Get Sensor Data and Calculate Driving Control ---
-        # accel, reverse_active, is_connected = self._get_sensor_data() Old data
-        # ay, accel_pressed, brake_pressed, reverse_active,is_connected = self._get_sensor_data()
-
-
-        # # Update the internal control state for driving axes
-        # self._control.throttle = control_values['throttle']
-        # self._control.steer = control_values['steer']
-        # self._control.brake = control_values['brake']
-        # # Set reverse based *only* on the phone's toggle state
-        # self._control.reverse = reverse_active
-
-        # --- Speed Limit ---
+        # --- Speed Limit (still handled locally) ---
         v = player.get_velocity()
         speed_kmh = 3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)
-        if speed_kmh >= self.max_speed_kph and self._control.throttle > 0:
-            # print(f"Speed limit ({self.max_speed_kph} kph) reached. Limiting throttle.") # Debug
-            self._control.throttle = 0.0 # Prevent further acceleration
+        # Max speed from arguments or a default
+        max_speed_kph_limit = world_instance.player_max_speed_fast * 3.6 if world_instance.player_max_speed_fast else 60.0 # Example
+        if hasattr(self, 'max_speed_kph'): # If SensorControl has its own max_speed_kph
+            max_speed_kph_limit = self.max_speed_kph
+
+        if speed_kmh >= max_speed_kph_limit and self._control.throttle > 0:
+            self._control.throttle = 0.0
 
         # --- Process Keyboard Events for Auxiliary Actions ---
         current_lights = self._lights
@@ -896,42 +663,31 @@ class SensorControl(object):
                 # self._control = carla.VehicleControl()
                 # player.apply_control(self._control)
 
-                # --- SEND HAPTIC TRIGGER (If any) ---
-        if haptic_trigger_message and self.client_conn:
-            try:
-                # print(f"Sending Haptic: {haptic_trigger_message.strip()}") # Debug print
-                self.client_conn.sendall(haptic_trigger_message.encode('utf-8'))
-            except socket.error as e:
-                print(f"SensorControl: Socket error sending haptic data: {e}")
-                # Handle error, maybe close connection?
-                try:
-                    self.client_conn.close()
-                except: pass
-                self.client_conn = None
-                # Update status to reflect potential disconnection
-                self._update_sensor_data(self.ay_data, self.gz_data, self.accelerate_pressed, self.brake_pressed, self.reverse_enabled, False)
-            except Exception as e:
-                print(f"SensorControl: Error sending haptic data: {e}")
-                # Handle other potential errors during send
+
+        
 
         return False # Continue loop
 
     def stop(self):
-        """Signals the listener thread to stop and waits for it to finish."""
-        print("SensorControl: Stopping listener thread...")
-        self._running_flag.clear()
-        if self._listener_thread.is_alive():
-            self._listener_thread.join(timeout=2.0)
-            if self._listener_thread.is_alive():
-                print("SensorControl: Warning! Listener thread did not exit cleanly.")
-            else:
-                print("SensorControl: Listener thread stopped.")
-        else:
-            print("SensorControl: Listener thread was already stopped.")
+        # This method is now primarily for cleaning up IPC if necessary,
+        # the TCP listener is in the MPC process.
+        print("Android_control: SensorControl stop called.")
+        # Signal MPC process to stop if this process is shutting down game_loop
+        if self.mpc_vehicle_data_pipe_send:
+            try:
+                self.mpc_vehicle_data_pipe_send.send(None) # Sentinel
+                self.mpc_vehicle_data_pipe_send.close()
+            except Exception as e:
+                print(f"Android_control: Error closing MPC send pipe: {e}")
+        if self.mpc_control_cmd_pipe_recv:
+             try:
+                self.mpc_control_cmd_pipe_recv.close()
+             except Exception as e:
+                print(f"Android_control: Error closing MPC recv pipe: {e}")
+
 
     @staticmethod
     def _is_quit_shortcut(key):
-        """Checks if the key combination is a quit shortcut."""
         return (key == K_ESCAPE) or (key == K_q and pygame.key.get_mods() & KMOD_CTRL)
 
 # ==============================================================================
@@ -1359,6 +1115,10 @@ def game_loop(args):
     world = None
     original_settings = None
     controller = None # Initialize controller variable
+    mpc_process_instance = None
+    # Pipes for communication: one for Android_control -> MPC, one for MPC -> Android_control
+    ac_to_mpc_pipe_parent, ac_to_mpc_pipe_child = multiprocessing.Pipe()
+    mpc_to_ac_pipe_parent, mpc_to_ac_pipe_child = multiprocessing.Pipe()
 
     try:
         client = carla.Client(args.host, args.port)
@@ -1372,30 +1132,38 @@ def game_loop(args):
             settings = sim_world.get_settings()
             if not settings.synchronous_mode:
                 settings.synchronous_mode = True
-                # Make the simulation step slightly smaller for potentially smoother control
-                settings.fixed_delta_seconds = 0.03 # ~33 FPS simulation rate
-                # settings.fixed_delta_seconds = 0.05 # ~20 FPS simulation rate (original)
+                settings.fixed_delta_seconds = args.delta_seconds # Use an arg for this
             sim_world.apply_settings(settings)
-
-            traffic_manager = client.get_trafficmanager(args.tm_port if hasattr(args, 'tm_port') else 8000) # Get TM port from args if available
+            traffic_manager = client.get_trafficmanager(args.tm_port)
             traffic_manager.set_synchronous_mode(True)
         else:
-             traffic_manager = client.get_trafficmanager(args.tm_port if hasattr(args, 'tm_port') else 8000)
+            traffic_manager = client.get_trafficmanager(args.tm_port)
+
 
 
         if args.autopilot and not sim_world.get_settings().synchronous_mode:
             print("WARNING: Autopilot requested in asynchronous mode. May lead to issues.")
 
-        display = pygame.display.set_mode(
-            (args.width, args.height),
-            pygame.HWSURFACE | pygame.DOUBLEBUF)
+        display = pygame.display.set_mode((args.width, args.height), pygame.HWSURFACE | pygame.DOUBLEBUF)
         display.fill((0,0,0))
         pygame.display.flip()
 
         hud = HUD(args.width, args.height)
-        world = World(sim_world, hud, traffic_manager, args)
+        world = World(sim_world, hud, traffic_manager, args) # Pass traffic_manager to World
+        # --- MPC Process Setup ---
+        mpc_params = {'horizon_N': 10, 'dt': args.delta_seconds if args.sync else 0.05} # Pass delta_seconds
+        # Ensure phone_tcp_config uses a *different* port if Android_control still has any TCP server
+        phone_tcp_config = {"host": "127.0.0.1", "port": 6002} # Port for MPC to listen to phone
+
+        mpc_process_instance = MPCProcess(ac_to_mpc_pipe_child, mpc_to_ac_pipe_parent, mpc_params, phone_tcp_config)
+        mpc_process_instance.start()
+        print("Game_loop: MPC Process started.")
+        # --- End MPC Process Setup ---
+
+
         # Instantiate SensorControl as the primary controller
-        controller = SensorControl(world, args.autopilot)
+        controller = SensorControl(world, args.autopilot, ac_to_mpc_pipe_parent, mpc_to_ac_pipe_child)
+
         # controller = KeyboardControl(world, args.autopilot) # Use this line instead if you want keyboard fallback
 
         if args.sync:
@@ -1415,10 +1183,9 @@ def game_loop(args):
                  # but we still tick Pygame clock for frame rate limiting.
                  clock.tick_busy_loop(60) # Limit client FPS
 
-            # Ensure controller exists before parsing events
-            if controller is None:
-                 print("Error: Controller not initialized.")
-                 break # Exit loop if controller failed to init
+            if not mpc_process_instance.is_alive() and mpc_process_instance.exitcode is not None :
+                print(f"Game_loop: MPC process has exited with code {mpc_process_instance.exitcode}. Stopping.")
+                break
 
             if controller.parse_events(client, world, clock, args.sync):
                 return # Exit loop if parse_events signals quit
@@ -1440,43 +1207,41 @@ def game_loop(args):
          traceback.print_exc()
 
     finally:
-        # --- Cleanup ---
-        print("Cleaning up resources...")
-        # Stop the sensor listener thread if it exists
+        print("Game_loop: Cleaning up resources...")
         if isinstance(controller, SensorControl):
-            controller.stop()
+            controller.stop() # This will now primarily close its ends of the pipes
 
-        # Restore original simulation settings if changed
+        if mpc_process_instance and mpc_process_instance.is_alive():
+            print("Game_loop: Signaling MPC process to stop...")
+            if ac_to_mpc_pipe_parent: # Check if pipe still valid before sending
+                try:
+                    ac_to_mpc_pipe_parent.send(None) # Sentinel to stop MPC process
+                except Exception as e:
+                    print(f"Game_loop: Error sending stop signal to MPC: {e}")
+            mpc_process_instance.join(timeout=2.0)
+            if mpc_process_instance.is_alive():
+                print("Game_loop: MPC process did not exit cleanly, terminating.")
+                mpc_process_instance.terminate()
+                mpc_process_instance.join(timeout=1.0)
+        print("Game_loop: MPC Process stopped.")
+
+        # Close parent ends of pipes
+        if ac_to_mpc_pipe_parent: ac_to_mpc_pipe_parent.close()
+        if mpc_to_ac_pipe_child: mpc_to_ac_pipe_child.close() # Child for MPC, parent for AC
+        # Child ends are closed by the MPCProcess when it exits or its __del__ is called.
+
+
         if original_settings and sim_world:
-             try:
-                 print("Restoring original world settings...")
-                 sim_world.apply_settings(original_settings)
-             except Exception as e:
-                  print(f"Error restoring world settings: {e}")
-
-
-        # Stop recorder if active
+             try: sim_world.apply_settings(original_settings)
+             except Exception as e: print(f"Error restoring world settings: {e}")
         if world and world.recording_enabled:
-            try:
-                print("Stopping recorder...")
-                client.stop_recorder()
-            except Exception as e:
-                 print(f"Error stopping recorder: {e}")
-
-
-        # Destroy world actors and sensors
+            try: client.stop_recorder()
+            except Exception as e: print(f"Error stopping recorder: {e}")
         if world is not None:
-            try:
-                print("Destroying world actors and sensors...")
-                world.destroy()
-            except Exception as e:
-                 print(f"Error destroying world: {e}")
-
-
-        # Quit Pygame
-        print("Quitting Pygame...")
+            try: world.destroy()
+            except Exception as e: print(f"Error destroying world: {e}")
         pygame.quit()
-        print("Cleanup finished.")
+        print("Game_loop: Cleanup finished.")
 
 
 # ==============================================================================
@@ -1499,6 +1264,9 @@ def main():
     argparser.add_argument('--sync', action='store_true', help='Activate synchronous mode execution')
     # Add TM port argument
     argparser.add_argument('--tm-port', metavar='P', default=8000, type=int, help='Port for Traffic Manager (default: 8000)')
+    argparser.add_argument('--delta_seconds', metavar='S', default=0.05, type=float, help='Fixed delta seconds for synchronous mode (default: 0.05)')
+    argparser.add_argument('--mpc_phone_port', metavar='P', default=6002, type=int, help='TCP port for MPC process to listen to phone sensors (default: 6002)')
+
 
 
     args = argparser.parse_args()
