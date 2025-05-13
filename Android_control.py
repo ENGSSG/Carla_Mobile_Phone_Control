@@ -24,8 +24,8 @@ import random
 import re
 import os
 import weakref
-import socket
-import threading
+# import socket
+# import threading
 import time
 import sys
 import traceback
@@ -298,174 +298,14 @@ class SensorControl(object):
         # Initialize player state
         world_instance = self._get_world()
         if world_instance and world_instance.player:
-            player = world_instance.player
-            if isinstance(player, carla.Vehicle):
-                player.set_autopilot(self._autopilot_enabled)
-                player.set_light_state(self._lights)
-                player.apply_control(self._control)
-            else:
-                print("Warning: SensorControl initialized with a non-vehicle player.")
-                self._control = None
+            world_instance.player.set_autopilot(self._autopilot_enabled)
             if world_instance.hud:
-                world_instance.hud.notification("Sensor Control Enabled. Press 'H' for help.", seconds=4.0)
-        else:
-            print("Error: SensorControl initialized with invalid world or player.")
-            self._control = None
+                world_instance.hud.notification(
+                    "Android MPC Control: Autopilot %s" % ('On' if self._autopilot_enabled else 'Off')
+                )
 
     def _get_world(self):
         return self._world_ref()
-
-    def _get_sensor_data(self):
-        with self._data_lock:
-            # return self.accelerometer_data, self.reverse_enabled, self._is_connected
-            return self.ay_data, self.gz_data, self.accelerate_pressed, self.brake_pressed, self.reverse_enabled, self._is_connected
-        self._is_connected
-
-    def _update_sensor_data(self, ay_val, gz_val, accel_state, brake_state, reverse_state, is_connected):
-         
-        with self._data_lock:
-        # self.accelerometer_data = accel # REMOVE
-            self.ay_data = ay_val
-            self.gz_data = gz_val
-            self.accelerate_pressed = accel_state
-            self.brake_pressed = brake_state
-            self.reverse_enabled = bool(reverse_state) # Ensure boolean
-            self._last_update_time = time.time()
-            self._is_connected = is_connected
-        
-            # print(f"Data updated: Accel={self.ay_data}, accel={self.accelerate_pressed},accel={self.brake_pressed}, Connected={is_connected}") # Debug
-
-    def _run_sensor_listener(self):
-        server_socket = None
-        client_conn = None
-        client_addr = None
-        try:
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind((self._tcp_host, self._tcp_port))
-            server_socket.listen(1)
-            print(f"SensorControl Listener: Socket bound and listening on {self._tcp_host}:{self._tcp_port}")
-        except socket.error as msg:
-            print(f"SensorControl Listener: Error setting up socket: {msg}")
-            traceback.print_exc()
-            if server_socket: server_socket.close()
-            self._running_flag.clear() # Stop if setup fails
-            return
-        except Exception as e:
-            print(f"SensorControl Listener: Unexpected setup error: {e}")
-            traceback.print_exc()
-            if server_socket: server_socket.close()
-            self._running_flag.clear()
-            return
-
-        while self._running_flag.is_set():
-            client_conn = None # Reset connection for each attempt
-            self.client_conn = None
-            try:
-                # Update status to disconnected before waiting
-                if not self._is_connected:
-                     self._update_sensor_data(self.ay_data, self.gz_data, self.accelerate_pressed, self.brake_pressed, self.reverse_enabled, False)
-
-                server_socket.settimeout(1.0) # Timeout to check running_flag
-                try:
-                    # print("SensorControl Listener: Waiting to accept...") # Debug
-                    client_conn, client_addr = server_socket.accept()
-                    self.client_conn = client_conn
-                    client_conn.settimeout(5.0) # Set a timeout for receiving data
-                    print(f"SensorControl Listener: Connection from {client_addr}")
-                    self._update_sensor_data(self.ay_data, self.gz_data, self.accelerate_pressed, self.brake_pressed, self.reverse_enabled, True) # Mark as connected
-                except socket.timeout:
-                    self.client_conn = None # Ensure None on timeout
-                    continue # Loop back to check running_flag
-                except socket.error as e_accept:
-                    print(f"SnnesorControl Listener: Error accepting connection: {e_accept}")
-                    self.client_conn = None
-                    time.sleep(0.5)
-                    continue
-
-                buffer = ""
-                while self._running_flag.is_set():
-                    try:
-                        data = client_conn.recv(self._buffer_size)
-                        if not data:
-                            print(f"SensorControl Listener: Client {client_addr} disconnected.")
-                            self._update_sensor_data(self.ay_data, self.gz_data, self.accelerate_pressed, self.brake_pressed, self.reverse_enabled, False)
-                            self.client_conn = None
-                            break # Break inner loop
-
-                        buffer += data.decode('utf-8')
-                        while '\n' in buffer:
-                            line, buffer = buffer.split('\n', 1)
-                            line = line.strip()
-                            if not line: continue
-
-                            parts = line.split(',')
-                            # Expecting 5 values: ay, gz, accelerate_state, brake_state, reverse_state
-                            if len(parts) == 5:
-                                try:
-                                    ay = float(parts[0])
-                                    gz = float(parts[1])
-                                    accel_state = int(parts[2]) # 0 or 1
-                                    brake_state = int(parts[3]) # 0 or 1
-                                    reverse_state = int(parts[4]) # 0 or 1
-                                    # Update internal data safely
-                                    self._update_sensor_data(ay, gz, accel_state, brake_state, reverse_state, True)
-                                except ValueError:
-                                    print(f"SensorControl Listener: Invalid values from {client_addr}: {line}")
-                                except Exception as parse_e:
-                                        print(f"SensorControl Listener: Error parsing values from {client_addr}: {parse_e} - Data: {line}")
-                            else:
-                                print(f"SensorControl Listener: Malformed data from {client_addr}: Got {len(parts)} vals. Expected 5 Data: '{line}'")
-
-                    except socket.timeout:
-                         print(f"SensorControl Listener: Timeout receiving data from {client_addr}. Closing connection.")
-                         self._update_sensor_data(self.ay_data, self.gz_data, self.accelerate_pressed, self.brake_pressed, self.reverse_enabled, False)
-                         self.client_conn = None
-                         break # Break inner loop, will try to accept again
-                    except socket.error as e:
-                        print(f"SensorControl Listener: Socket error recv from {client_addr}: {e}")
-                        self._update_sensor_data(self.ay_data, self.gz_data, self.accelerate_pressed, self.brake_pressed, self.reverse_enabled, False)
-                        self.client_conn = None
-                        traceback.print_exc()
-                        break
-                    except UnicodeDecodeError:
-                        print(f"SensorControl Listener: Non-UTF-8 data from {client_addr}.")
-                        buffer = "" # Clear buffer on decode error
-                    except Exception as e:
-                        print(f"SensorControl Listener: Processing error from {client_addr}: {e}")
-                        self._update_sensor_data(self.ay_data, self.gz_data, self.accelerate_pressed, self.brake_pressed, self.reverse_enabled, False)
-                        traceback.print_exc()
-                        break # Break inner loop
-
-            except socket.error as e:
-                 print(f"SensorControl Listener: Error accepting connection: {e}")
-                 self._update_sensor_data(self.ay_data, self.gz_data, self.accelerate_pressed, self.brake_pressed, self.reverse_enabled, False)
-                 time.sleep(1)
-            except Exception as e:
-                 print(f"SensorControl Listener: Unexpected error in accept loop: {e}")
-                 self._update_sensor_data(self.ay_data, self.gz_data, self.accelerate_pressed, self.brake_pressed, self.reverse_enabled, False)
-                 traceback.print_exc()
-                 time.sleep(1)
-            finally:
-                if client_conn:
-                    print(f"SensorControl Listener: Closing connection to {client_addr}")
-                    try: client_conn.shutdown(socket.SHUT_RDWR)
-                    except socket.error: pass
-                    try: client_conn.close()
-                    except socket.error: pass
-                    client_conn = None
-                    # Ensure status is updated if connection closed cleanly or abnormally
-                    self._update_sensor_data(self.ay_data, self.gz_data, self.accelerate_pressed, self.brake_pressed, self.reverse_enabled, False)
-                    self.client_conn = None
-
-
-        print("SensorControl Listener: Stopping...")
-        if server_socket:
-            try: server_socket.close()
-            except socket.error: pass
-            print("SensorControl Listener: Server socket closed.")
-        self.client_conn = None
-
 
     def parse_events(self, client, world, clock, sync_mode):
         """
@@ -564,17 +404,6 @@ class SensorControl(object):
             # print("Android_control: No command from MPC this tick.")
             # pass
 
-
-        # --- Speed Limit (still handled locally) ---
-        v = player.get_velocity()
-        speed_kmh = 3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)
-        # Max speed from arguments or a default
-        max_speed_kph_limit = world_instance.player_max_speed_fast * 3.6 if world_instance.player_max_speed_fast else 60.0 # Example
-        if hasattr(self, 'max_speed_kph'): # If SensorControl has its own max_speed_kph
-            max_speed_kph_limit = self.max_speed_kph
-
-        if speed_kmh >= max_speed_kph_limit and self._control.throttle > 0:
-            self._control.throttle = 0.0
 
         # --- Process Keyboard Events for Auxiliary Actions ---
         current_lights = self._lights
@@ -1114,25 +943,21 @@ def game_loop(args):
     pygame.font.init()
     world = None
     original_settings = None
-    controller = None # Initialize controller variable
     mpc_process_instance = None
-    # Pipes for communication: one for Android_control -> MPC, one for MPC -> Android_control
     ac_to_mpc_pipe_parent, ac_to_mpc_pipe_child = multiprocessing.Pipe()
     mpc_to_ac_pipe_parent, mpc_to_ac_pipe_child = multiprocessing.Pipe()
+    controller = None # Initialize controller variable
 
     try:
         client = carla.Client(args.host, args.port)
-        client.set_timeout(20.0) # Increased timeout slightly
-
+        client.set_timeout(20.0)
         sim_world = client.get_world()
 
-        # Setup sync mode if requested
         if args.sync:
             original_settings = sim_world.get_settings()
             settings = sim_world.get_settings()
-            if not settings.synchronous_mode:
-                settings.synchronous_mode = True
-                settings.fixed_delta_seconds = args.delta_seconds # Use an arg for this
+            if not settings.synchronous_mode: settings.synchronous_mode = True
+            settings.fixed_delta_seconds = args.delta_seconds
             sim_world.apply_settings(settings)
             traffic_manager = client.get_trafficmanager(args.tm_port)
             traffic_manager.set_synchronous_mode(True)
@@ -1140,106 +965,88 @@ def game_loop(args):
             traffic_manager = client.get_trafficmanager(args.tm_port)
 
 
-
-        if args.autopilot and not sim_world.get_settings().synchronous_mode:
-            print("WARNING: Autopilot requested in asynchronous mode. May lead to issues.")
-
         display = pygame.display.set_mode((args.width, args.height), pygame.HWSURFACE | pygame.DOUBLEBUF)
         display.fill((0,0,0))
         pygame.display.flip()
 
         hud = HUD(args.width, args.height)
-        world = World(sim_world, hud, traffic_manager, args) # Pass traffic_manager to World
-        # --- MPC Process Setup ---
-        mpc_params = {'horizon_N': 10, 'dt': args.delta_seconds if args.sync else 0.05} # Pass delta_seconds
-        # Ensure phone_tcp_config uses a *different* port if Android_control still has any TCP server
-        phone_tcp_config = {"host": "127.0.0.1", "port": 6002} # Port for MPC to listen to phone
+        world = World(sim_world, hud, traffic_manager, args) # Pass TM and args
 
-        mpc_process_instance = MPCProcess(ac_to_mpc_pipe_child, mpc_to_ac_pipe_parent, mpc_params, phone_tcp_config)
+        # --- MPC Process Setup ---
+        mpc_init_params = {'horizon_N': 10, 'dt': args.delta_seconds if args.sync else 0.05}
+        # Add MPC tuning parameters that might come from args or be fixed
+        mpc_tuning_params = {
+            'q_angle_error': 1.5, 'q_rate_error': 0.5, 'q_speed_error': 2.0,
+            'r_steer_rate_cmd': 0.1, 'r_accel_cmd': 0.05,
+            's_delta_steer_rate_cmd': 0.5, 's_delta_accel_cmd': 0.2,
+            'max_steer_angle_deg': 35.0, 'max_steer_rate_rps': np.radians(70.0),
+            'max_accel_mps2': 3.0, 'max_decel_mps2': -5.0, # Note: decel is negative
+            'steer_angle_sensitivity_phone': 0.5, 'steering_angle_deadzone_phone': 0.5,
+            'max_vehicle_steer_angle_deg_phone': 70,
+            'steer_rate_sensitivity_phone': 0.8, 'steering_rate_deadzone_phone': 0.1,
+            'max_vehicle_steer_rate_rps_deg_phone': 90.0
+        }
+        # Override from args if provided (example for max_accel)
+        if hasattr(args, 'mpc_max_accel'): mpc_tuning_params['max_accel_mps2'] = args.mpc_max_accel
+
+
+        phone_tcp_config = {"host": args.mpc_phone_host, "port": args.mpc_phone_port}
+
+        mpc_process_instance = MPCProcess(ac_to_mpc_pipe_child, mpc_to_ac_pipe_parent,
+                                          mpc_init_params, phone_tcp_config, mpc_tuning_params)
         mpc_process_instance.start()
         print("Game_loop: MPC Process started.")
         # --- End MPC Process Setup ---
 
-
-        # Instantiate SensorControl as the primary controller
         controller = SensorControl(world, args.autopilot, ac_to_mpc_pipe_parent, mpc_to_ac_pipe_child)
 
-        # controller = KeyboardControl(world, args.autopilot) # Use this line instead if you want keyboard fallback
-
-        if args.sync:
-            sim_world.tick()
-        else:
-            sim_world.wait_for_tick()
+        if args.sync: sim_world.tick()
+        else: sim_world.wait_for_tick()
 
         clock = pygame.time.Clock()
         while True:
-            if args.sync:
-                # Important: Tick the world *before* parsing events in sync mode
-                # to ensure sensor data used for control is from the *current* frame.
-                sim_world.tick()
-                clock.tick() # Tick the Pygame clock as well
-            else:
-                 # In async mode, wait for tick happens implicitly,
-                 # but we still tick Pygame clock for frame rate limiting.
-                 clock.tick_busy_loop(60) # Limit client FPS
+            if args.sync: sim_world.tick(); clock.tick()
+            else: clock.tick_busy_loop(60)
 
-            if not mpc_process_instance.is_alive() and mpc_process_instance.exitcode is not None :
+            if mpc_process_instance and not mpc_process_instance.is_alive() and mpc_process_instance.exitcode is not None:
                 print(f"Game_loop: MPC process has exited with code {mpc_process_instance.exitcode}. Stopping.")
                 break
 
-            if controller.parse_events(client, world, clock, args.sync):
-                return # Exit loop if parse_events signals quit
-
-            # Tick the game world state (mainly HUD updates)
-            # This should happen *after* controls are potentially applied by parse_events
-            if world: # Check if world exists
-                 world.tick(clock)
-
-            # Render the world (camera + HUD)
-            if world: # Check if world exists
-                 world.render(display)
-
-            pygame.display.flip() # Update the display
+            if controller.parse_events(client, world, clock, args.sync): break
+            if world: world.tick(clock)
+            if world: world.render(display)
+            pygame.display.flip()
 
     except Exception as e:
-         # Log any unexpected exceptions during the game loop
          logging.error("Error during game loop: %s", e)
          traceback.print_exc()
-
     finally:
         print("Game_loop: Cleaning up resources...")
-        if isinstance(controller, SensorControl):
-            controller.stop() # This will now primarily close its ends of the pipes
+        if isinstance(controller, SensorControl): controller.stop()
 
         if mpc_process_instance and mpc_process_instance.is_alive():
             print("Game_loop: Signaling MPC process to stop...")
-            if ac_to_mpc_pipe_parent: # Check if pipe still valid before sending
-                try:
-                    ac_to_mpc_pipe_parent.send(None) # Sentinel to stop MPC process
-                except Exception as e:
-                    print(f"Game_loop: Error sending stop signal to MPC: {e}")
+            if ac_to_mpc_pipe_parent:
+                try: ac_to_mpc_pipe_parent.send(None)
+                except Exception as e_pipe: print(f"Game_loop: Error sending stop signal to MPC: {e_pipe}")
             mpc_process_instance.join(timeout=2.0)
             if mpc_process_instance.is_alive():
                 print("Game_loop: MPC process did not exit cleanly, terminating.")
-                mpc_process_instance.terminate()
-                mpc_process_instance.join(timeout=1.0)
+                mpc_process_instance.terminate(); mpc_process_instance.join(timeout=1.0)
         print("Game_loop: MPC Process stopped.")
 
-        # Close parent ends of pipes
         if ac_to_mpc_pipe_parent: ac_to_mpc_pipe_parent.close()
-        if mpc_to_ac_pipe_child: mpc_to_ac_pipe_child.close() # Child for MPC, parent for AC
-        # Child ends are closed by the MPCProcess when it exits or its __del__ is called.
-
+        if mpc_to_ac_pipe_child: mpc_to_ac_pipe_child.close()
 
         if original_settings and sim_world:
              try: sim_world.apply_settings(original_settings)
-             except Exception as e: print(f"Error restoring world settings: {e}")
-        if world and world.recording_enabled:
+             except Exception as e_settings: print(f"Error restoring world settings: {e_settings}")
+        if world and world.recording_enabled and client:
             try: client.stop_recorder()
-            except Exception as e: print(f"Error stopping recorder: {e}")
+            except Exception as e_rec: print(f"Error stopping recorder: {e_rec}")
         if world is not None:
             try: world.destroy()
-            except Exception as e: print(f"Error destroying world: {e}")
+            except Exception as e_destroy: print(f"Error destroying world: {e_destroy}")
         pygame.quit()
         print("Game_loop: Cleanup finished.")
 
@@ -1250,53 +1057,39 @@ def game_loop(args):
 
 
 def main():
-    argparser = argparse.ArgumentParser(description='CARLA Manual Control Client (Accelerometer)') # Updated description
-    # Keep existing arguments
+    argparser = argparse.ArgumentParser(description='CARLA Android MPC Control Client')
     argparser.add_argument('-v', '--verbose', action='store_true', dest='debug', help='print debug information')
     argparser.add_argument('--host', metavar='H', default='127.0.0.1', help='IP of the host server (default: 127.0.0.1)')
     argparser.add_argument('-p', '--port', metavar='P', default=2000, type=int, help='TCP port to listen to (default: 2000)')
-    argparser.add_argument('-a', '--autopilot', action='store_true', help='enable autopilot (overridden by sensor control)')
-    argparser.add_argument('--res', metavar='WIDTHxHEIGHT', default='1280x720', help='window resolution (default: 1280x720)')
-    argparser.add_argument('--filter', metavar='PATTERN', default='vehicle.*', help='actor filter (default: "vehicle.*")')
-    argparser.add_argument('--generation', metavar='G', default='All', help='restrict to certain actor generation (values: "1","2","All" - default: "All")') # Corrected values
+    argparser.add_argument('-a', '--autopilot', action='store_true', help='enable autopilot')
     argparser.add_argument('--rolename', metavar='NAME', default='hero', help='actor role name (default: "hero")')
-    argparser.add_argument('--gamma', default=2.2, type=float, help='Gamma correction of the camera (default: 2.2)') # Default gamma is often 2.2
+    argparser.add_argument('--gamma', default=2.2, type=float, help='Gamma correction of the camera (default: 2.2)')
+    argparser.add_argument('--width', default=1280, type=int, help='window width (default: 1280)')
+    argparser.add_argument('--height', default=720, type=int, help='window height (default: 720)')
+    argparser.add_argument('--filter', metavar='PATTERN', default='vehicle.tesla.model3', help='actor filter (default: "vehicle.tesla.model3")')
+    argparser.add_argument('--generation', metavar='G', default='2', help='restrict to certain actor generation (values: "1","2","All") (default: "2")')
     argparser.add_argument('--sync', action='store_true', help='Activate synchronous mode execution')
-    # Add TM port argument
-    argparser.add_argument('--tm-port', metavar='P', default=8000, type=int, help='Port for Traffic Manager (default: 8000)')
     argparser.add_argument('--delta_seconds', metavar='S', default=0.05, type=float, help='Fixed delta seconds for synchronous mode (default: 0.05)')
-    argparser.add_argument('--mpc_phone_port', metavar='P', default=6002, type=int, help='TCP port for MPC process to listen to phone sensors (default: 6002)')
+    argparser.add_argument('--tm_port', metavar='P', default=8000, type=int, help='Port for Traffic Manager (default: 8000)')
+    argparser.add_argument('--output_file', default='android_control_replay.log', help='File to save/load replay data')
+    argparser.add_argument('--player_max_speed_fast', default=15.0, type=float, help='Fast speed for player in m/s (default: 15.0 for ~54km/h)')
+    argparser.add_argument('--mpc_phone_host', default="0.0.0.0", help='Host for MPC to listen for phone sensors (default: 0.0.0.0 for all interfaces)')
+    argparser.add_argument('--mpc_phone_port', default=6002, type=int, help='TCP port for MPC process to listen to phone sensors (default: 6002)')
+    # argparser.add_argument('--mpc_max_accel', default=3.0, type=float, help='Max acceleration for MPC in m/s^2 (default: 3.0)')
 
 
 
     args = argparser.parse_args()
-
-    # Validate resolution format
-    try:
-        args.width, args.height = [int(x) for x in args.res.split('x')]
-    except ValueError:
-        print("Error: Invalid resolution format. Use WIDTHxHEIGHT (e.g., 1280x720)")
-        sys.exit(1)
-
+    if args.sync and args.delta_seconds <= 0: raise ValueError("fixed_delta_seconds must be positive if sync mode is enabled.")
 
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(format='%(levelname)s: %(message)s', level=log_level)
-
     logging.info('listening to server %s:%s', args.host, args.port)
-
-    # Update help text if needed
-    # print(__doc__) # You might want to update the help text at the top
-
+    print(__doc__)
     try:
         game_loop(args)
-
-    except KeyboardInterrupt:
-        print('\nCancelled by user. Bye!')
-    except Exception as e:
-         # Catch exceptions happening outside the main game loop (e.g., during setup)
-         logging.critical("Unhandled exception: %s", e)
-         traceback.print_exc()
-
+    except KeyboardInterrupt: print('\nCancelled by user. Bye!')
+    except Exception as e: logging.critical("Unhandled exception in main: %s", e); traceback.print_exc()
 
 if __name__ == '__main__':
     main()
