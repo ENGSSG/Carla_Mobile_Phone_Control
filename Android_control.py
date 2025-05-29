@@ -1039,7 +1039,7 @@ def game_loop(args):
         world = World(sim_world, hud, traffic_manager, args) # Pass TM to World
 
         # MPC Process Setup
-        mpc_params = {'horizon_N': 10, 'dt': args.delta_seconds if args.sync else 0.017, 'wheelbase': 2.5}
+        mpc_params = {'horizon_N': 10, 'dt': args.delta_seconds if args.sync else 0.05, 'wheelbase': 2.5}
         phone_tcp_config = {"host": args.mpc_phone_host, "port": args.mpc_phone_port}
         control_config = { # Pass all relevant control tuning parameters from args
             "steer_angle_sensitivity": args.steer_angle_sensitivity,
