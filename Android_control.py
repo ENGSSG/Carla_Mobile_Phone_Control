@@ -24,12 +24,14 @@ import random
 import re
 import os
 import weakref
-# import socket
-# import threading
+import socket
+import threading
 import time
 import sys
 import traceback
 import multiprocessing
+import json
+import queue
 from mpc_controller import MPCProcess
 
 
@@ -138,66 +140,51 @@ class World(object):
             carla.MapLayer.Walls, carla.MapLayer.All
         ]
 
-    def restart(self):
-        self.player_max_speed = 1.589
-        self.player_max_speed_fast = 3.713
+    def restart(self): # Removed args from here, should be passed during init
+        args = self._actor_filter # Assuming this was the intent or pass args properly
+        self.player_max_speed = 1.589; self.player_max_speed_fast = 3.713
         cam_index = self.camera_manager.index if self.camera_manager is not None else 0
         cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
+        
         blueprint_list = get_actor_blueprints(self.world, self._actor_filter, self._actor_generation)
-        if not blueprint_list:
-            raise ValueError("Couldn't find any blueprints with the specified filters")
+        if not blueprint_list: raise ValueError("Couldn't find any blueprints with the specified filters")
         blueprint = random.choice(blueprint_list)
         blueprint.set_attribute('role_name', self.actor_role_name)
         if blueprint.has_attribute('terramechanics'): blueprint.set_attribute('terramechanics', 'true')
         if blueprint.has_attribute('color'):
-            color = random.choice(blueprint.get_attribute('color').recommended_values)
-            blueprint.set_attribute('color', color)
+            blueprint.set_attribute('color', random.choice(blueprint.get_attribute('color').recommended_values))
         if blueprint.has_attribute('driver_id'):
-            driver_id = random.choice(blueprint.get_attribute('driver_id').recommended_values)
-            blueprint.set_attribute('driver_id', driver_id)
+            blueprint.set_attribute('driver_id', random.choice(blueprint.get_attribute('driver_id').recommended_values))
         if blueprint.has_attribute('is_invincible'): blueprint.set_attribute('is_invincible', 'true')
         if blueprint.has_attribute('speed'):
-            try: # Handle potential missing values or format issues
+            try:
                 rec_values = blueprint.get_attribute('speed').recommended_values
-                if len(rec_values) >= 3:
-                    self.player_max_speed = float(rec_values[1])
-                    self.player_max_speed_fast = float(rec_values[2])
-                elif len(rec_values) == 2: # Fallback if only two values
-                     self.player_max_speed = float(rec_values[1])
-                     self.player_max_speed_fast = float(rec_values[1]) # Use same value
-            except (ValueError, IndexError, AttributeError) as e:
-                 print(f"Warning: Could not set max speed from blueprint: {e}. Using defaults.")
-
+                if len(rec_values) >= 3: self.player_max_speed, self.player_max_speed_fast = float(rec_values[1]), float(rec_values[2])
+                elif len(rec_values) == 2: self.player_max_speed = self.player_max_speed_fast = float(rec_values[1])
+            except: print(f"Warning: Could not set max speed from blueprint. Using defaults.")
 
         if self.player is not None:
             spawn_point = self.player.get_transform()
-            spawn_point.location.z += 2.0
-            spawn_point.rotation.roll = 0.0
-            spawn_point.rotation.pitch = 0.0
-            self.destroy()
-            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
-            self.show_vehicle_telemetry = False
-            self.modify_vehicle_physics(self.player)
+            spawn_point.location.z += 2.0; spawn_point.rotation.roll = 0.0; spawn_point.rotation.pitch = 0.0
+            self.destroy(); self.player = self.world.try_spawn_actor(blueprint, spawn_point)
+            self.show_vehicle_telemetry = False; self.modify_vehicle_physics(self.player)
         while self.player is None:
-            if not self.map.get_spawn_points():
-                print('There are no spawn points available in your map/town.')
-                sys.exit(1)
-            spawn_points = self.map.get_spawn_points()
-            spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
+            if not self.map.get_spawn_points(): print('There are no spawn points available.'); sys.exit(1)
+            spawn_point = random.choice(self.map.get_spawn_points()) if self.map.get_spawn_points() else carla.Transform()
             self.player = self.world.try_spawn_actor(blueprint, spawn_point)
-            self.show_vehicle_telemetry = False
-            self.modify_vehicle_physics(self.player)
+            self.show_vehicle_telemetry = False; self.modify_vehicle_physics(self.player)
 
         self.collision_sensor = CollisionSensor(self.player, self.hud)
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
         self.gnss_sensor = GnssSensor(self.player)
-        self.imu_sensor = IMUSensor(self.player) # Keep for accel display in HUD
+        self.imu_sensor = IMUSensor(self.player)
         self.camera_manager = CameraManager(self.player, self.hud, self._gamma)
         self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.set_sensor(cam_index, notify=False)
-        actor_type = get_actor_display_name(self.player)
-        self.hud.notification(actor_type)
-        self.traffic_manager.update_vehicle_lights(self.player, True)
+        self.hud.notification(get_actor_display_name(self.player))
+        if self.traffic_manager: # Check if traffic_manager is available
+             self.traffic_manager.update_vehicle_lights(self.player, True)
+
 
         if self.sync: self.world.tick()
         else: self.world.wait_for_tick()
@@ -279,108 +266,259 @@ class World(object):
 # -- SensorControl (Refactored for IPC with MPCProcess) ------------------------
 # ==============================================================================
 class SensorControl(object):
-    def __init__(self, world, start_in_autopilot, mpc_vehicle_data_pipe, mpc_control_cmd_pipe):
-        self._world_ref = weakref.ref(world) # world is an instance of World class
+    def __init__(self, world, start_in_autopilot,
+                 mpc_vehicle_data_address=('127.0.0.1', 6003),
+                 control_cmd_server_address=('127.0.0.1', 6004)):
+        self._world_ref = weakref.ref(world)
         self._autopilot_enabled = start_in_autopilot
-        self._control = carla.VehicleControl() # CARLA vehicle control object
+        self._control = carla.VehicleControl() 
         self._lights = carla.VehicleLightState.NONE
         
-        # IPC Pipes
-        self.mpc_vehicle_data_pipe_send = mpc_vehicle_data_pipe # To send vehicle data to MPC
-        self.mpc_control_cmd_pipe_recv = mpc_control_cmd_pipe   # To receive control commands from MPC
+        # IPC Sockets Configuration
+        self.mpc_vehicle_data_address = mpc_vehicle_data_address
+        self.control_cmd_server_address = control_cmd_server_address
         
+        # Socket for sending vehicle data to MPC (client)
+        self.vehicle_data_socket_client = None
+        
+        # Server socket for receiving control commands from MPC
+        self.control_cmd_socket_server = None
+        self.control_cmd_conn = None 
+
+        self._data_lock = threading.Lock() 
+        self._last_mpc_control_update_time = time.time()
+
+        # --- Queue for outgoing vehicle data to MPC ---
+        self.vehicle_data_send_queue = queue.Queue(maxsize=10) # Adjust maxsize as needed
+
+        # --- Thread for Vehicle Data Sender ---
+        self._vehicle_data_sender_running_flag = threading.Event(); self._vehicle_data_sender_running_flag.set()
+        self._vehicle_data_sender_thread = threading.Thread(target=self._run_vehicle_data_sender, daemon=True)
+        self._vehicle_data_sender_thread.start()
+        print(f"Android_control: Vehicle data sender thread started for MPC @ {self.mpc_vehicle_data_address}")
+
+        # --- Thread for Control Command Server (as before) ---
+        self._control_server_running_flag = threading.Event(); self._control_server_running_flag.set()
+        self._control_server_thread = threading.Thread(target=self._run_control_command_server, daemon=True)
+        self._control_server_thread.start()
+        print(f"Android_control: Control command server thread started on {self.control_cmd_server_address}")
+
+        # Initial connection attempt for vehicle data sender (non-blocking for __init__)
+        # The sender thread will handle robust connection.
+
+
         world_instance = self._get_world()
         if world_instance and world_instance.player:
             player = world_instance.player
             if isinstance(player, carla.Vehicle):
                 player.set_autopilot(self._autopilot_enabled)
                 player.set_light_state(self._lights)
-                player.apply_control(self._control) # Apply initial zeroed control
-            else:
-                print("Warning: SensorControl initialized with a non-vehicle player.")
-                self._control = None 
-            if world_instance.hud:
-                world_instance.hud.notification("Sensor Control (via MPC) Enabled. Press 'H' for help.", seconds=4.0)
-        else:
-            print("Error: SensorControl initialized with invalid world or player.")
-            self._control = None
+                player.apply_control(self._control)
+            else: self._control = None # Not a vehicle
+            if world_instance.hud: world_instance.hud.notification("Sensor Control (IPC via Sockets). Press 'H'.", seconds=4.0)
+        else: self._control = None; print("Error: SensorControl initialized with invalid world or player.")
+
+    def _connect_vehicle_data_client_with_retries(self, max_retries=3, delay=1):
+        """Tries to connect the vehicle data client socket with retries."""
+        for attempt in range(max_retries):
+            if self._connect_vehicle_data_client():
+                return True
+            # print(f"Android_control (SenderThread): Vehicle data server connection attempt {attempt+1} failed. Retrying in {delay}s...")
+            if not self._vehicle_data_sender_running_flag.is_set(): break # Stop retrying if thread is stopping
+            time.sleep(delay)
+        # print("Android_control (SenderThread): Failed to connect to MPC vehicle data server after multiple retries.")
+        return False
+
+    def _connect_vehicle_data_client(self):
+        """Establishes a client socket connection to MPCProcess for sending vehicle data."""
+        try:
+            if self.vehicle_data_socket_client: self.vehicle_data_socket_client.close()
+            self.vehicle_data_socket_client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.vehicle_data_socket_client.settimeout(2.0) 
+            self.vehicle_data_socket_client.connect(self.mpc_vehicle_data_address)
+            print(f"Android_control: Connected to MPC vehicle data server at {self.mpc_vehicle_data_address}")
+            return True
+        except Exception as e:
+            # print(f"Android_control: Failed to connect to MPC vehicle data server: {e}") # Less verbose during retries
+            if self.vehicle_data_socket_client: self.vehicle_data_socket_client.close()
+            self.vehicle_data_socket_client = None
+            return False
+
+    def _actual_send_vehicle_data(self, data_to_mpc_json_str):
+        """The actual socket send operation for the sender thread."""
+        if not self.vehicle_data_socket_client:
+            if not self._connect_vehicle_data_client_with_retries(max_retries=1, delay=0.1):
+                return False
+        try:
+            self.vehicle_data_socket_client.sendall(data_to_mpc_json_str.encode('utf-8'))
+            return True
+        except (socket.error, BrokenPipeError, ConnectionRefusedError) as e:
+            print(f"Android_control (SenderThread): Error sending vehicle data: {e}. Closing connection.")
+            if self.vehicle_data_socket_client:
+                try: self.vehicle_data_socket_client.close()
+                except: pass
+            self.vehicle_data_socket_client = None
+            return False
+        except Exception as e:
+            print(f"Android_control (SenderThread): Unexpected error sending vehicle data: {e}")
+            if self.vehicle_data_socket_client:
+                try: self.vehicle_data_socket_client.close()
+                except: pass
+            self.vehicle_data_socket_client = None
+            return False
+        
+    def _run_vehicle_data_sender(self):
+        """Dedicated thread to send vehicle data from a queue to MPCProcess."""
+        while self._vehicle_data_sender_running_flag.is_set():
+            try:
+                # Wait for data in the queue with a timeout to allow checking the running flag
+                data_to_send = self.vehicle_data_send_queue.get(timeout=1.0) 
+                if data_to_send is None: # Sentinel value to stop the thread
+                    break
+                
+                message_json = json.dumps(data_to_send) + "\n"
+                if not self._actual_send_vehicle_data(message_json):
+                    print("Android_control (SenderThread): Failed to send vehicle data. Data might be lost or requeued if implemented.")
+                    # Optional: Implement a retry mechanism or re-queueing logic here if data loss is critical
+                    # For now, if send fails, data is dropped to prevent queue buildup if connection is persistently bad.
+                    # self.vehicle_data_send_queue.put(data_to_send) # Example: re-queueing (use with caution)
+
+            except queue.Empty:
+                # Queue was empty, check if we are connected, if not, try to connect
+                if not self.vehicle_data_socket_client and self._vehicle_data_sender_running_flag.is_set():
+                    self._connect_vehicle_data_client_with_retries(max_retries=1, delay=0.1)
+                continue # Loop back to wait for more data or check running flag
+            except Exception as e:
+                print(f"Android_control (SenderThread): Unexpected error: {e}")
+                traceback.print_exc()
+                # Ensure the socket is reset on major error to force reconnection attempt
+                if self.vehicle_data_socket_client:
+                    try: self.vehicle_data_socket_client.close()
+                    except: pass
+                    self.vehicle_data_socket_client = None
+                if self._vehicle_data_sender_running_flag.is_set():
+                    time.sleep(0.5) # Brief pause before retrying loop
+        
+        print("Android_control: Vehicle data sender thread stopping.")
+        if self.vehicle_data_socket_client:
+            try: self.vehicle_data_socket_client.close()
+            except: pass
+            self.vehicle_data_socket_client = None
+
+    def _run_control_command_server(self):
+        # This method remains the same as in the previous version (for receiving MPC commands)
+        # Ensure it correctly updates self._control using self._data_lock
+        try:
+            self.control_cmd_socket_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.control_cmd_socket_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.control_cmd_socket_server.bind(self.control_cmd_server_address)
+            self.control_cmd_socket_server.listen(1)
+            print(f"Android_control: Control command server listening on {self.control_cmd_server_address}")
+        except Exception as e:
+            print(f"Android_control: Failed to set up control command server: {e}")
+            if self.control_cmd_socket_server: self.control_cmd_socket_server.close()
+            self.control_cmd_socket_server = None; return
+
+        while self._control_server_running_flag.is_set():
+            conn = None # Temporary connection for this accept loop
+            try:
+                self.control_cmd_socket_server.settimeout(1.0) 
+                conn, addr = self.control_cmd_socket_server.accept()
+                conn.settimeout(1.0) 
+                # print(f"Android_control: Accepted control command connection from MPC at {addr}") # Can be verbose
+                
+                buffer = b""
+                while self._control_server_running_flag.is_set():
+                    try:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            # print("Android_control: MPC control command connection closed by MPCProcess."); 
+                            break 
+                        buffer += chunk
+                        if b"\n" in buffer: 
+                            message_json, buffer = buffer.split(b"\n", 1)
+                            mpc_command = json.loads(message_json.decode('utf-8'))
+                            with self._data_lock: 
+                                self._control.steer = mpc_command.get('steer', self._control.steer)
+                                self._control.throttle = mpc_command.get('throttle', self._control.throttle)
+                                self._control.brake = mpc_command.get('brake', self._control.brake)
+                                self._control.reverse = mpc_command.get('reverse', self._control.reverse)
+                                self._last_mpc_control_update_time = time.time()
+                    except socket.timeout: continue 
+                    except (json.JSONDecodeError, UnicodeDecodeError) as e: print(f"Android_control: Error decoding MPC command: {e}"); buffer=b""
+                    except (ConnectionResetError, BrokenPipeError, socket.error) as e:
+                        print(f"Android_control: MPC control connection error: {e}"); break 
+                    except Exception as e: print(f"Android_control: Error processing MPC command: {e}"); break
+            except socket.timeout: continue 
+            except Exception as e:
+                print(f"Android_control: Error in control command server accept loop: {e}")
+                if self._control_server_running_flag.is_set(): time.sleep(1) 
+            finally:
+                if conn:
+                    try: conn.close()
+                    except: pass
+        
+        print("Android_control: Control command server thread stopping.")
+        if self.control_cmd_socket_server:
+            try: self.control_cmd_socket_server.close()
+            except: pass
+            self.control_cmd_socket_server = None
+            
 
     def _get_world(self):
         return self._world_ref()
 
     def parse_events(self, client, world, clock, sync_mode): # world here is the World class instance
         world_instance = self._get_world()
-        if not world_instance or not self._control or not world_instance.player or not world_instance.player.is_alive:
+        if not world_instance or not world_instance.player or not world_instance.player.is_alive:
             for event in pygame.event.get():
-                if event.type == pygame.QUIT or (event.type == pygame.KEYUP and self._is_quit_shortcut(event.key)):
-                    return True # Signal to quit
-            return False # Cannot control
+                if event.type == pygame.QUIT or (event.type == pygame.KEYUP and self._is_quit_shortcut(event.key)): return True
+            return False
 
         player = world_instance.player
         
-        # --- Prepare and Send Vehicle Data to MPCProcess ---
-        transform = player.get_transform()
-        velocity = player.get_velocity()
-        physics_control = player.get_physics_control()
-        
-        current_steer_angle_rad = 0.0
-        max_physical_steer_angle_rad = np.radians(70.0) # Default/fallback
+        # --- Prepare Vehicle Data ---
+        transform = player.get_transform(); velocity = player.get_velocity(); physics_control = player.get_physics_control()
+        current_steer_angle_rad = 0.0; max_physical_steer_angle_rad = np.radians(70.0)
         try:
-            # Get current steer angle of the front-left wheel in RADIANS
             current_steer_angle_rad = np.radians(player.get_wheel_steer_angle(carla.VehicleWheelLocation.FL_Wheel))
-            # Get max steer angle from the vehicle's physics for normalization in MPC
-            if physics_control and physics_control.wheels:
-                 max_physical_steer_angle_rad = np.radians(physics_control.wheels[0].max_steer_angle)
-        except Exception as e:
-            # print(f"Android_control: Warning: Could not get wheel/physics steer angle: {e}. Using defaults.")
-            pass
+            if physics_control and physics_control.wheels: max_physical_steer_angle_rad = np.radians(physics_control.wheels[0].max_steer_angle)
+        except: pass
 
+        current_vehicle_state_list = [
+            transform.location.x, transform.location.y, np.radians(transform.rotation.yaw),
+            np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2), current_steer_angle_rad ]
 
-        current_vehicle_state = np.array([
-            transform.location.x,
-            transform.location.y,
-            np.radians(transform.rotation.yaw), # Yaw in radians
-            np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2), # Speed in m/s
-            current_steer_angle_rad # Current steering angle in radians
-        ])
+        collision_intensity = world_instance.collision_sensor.get_collision_intensity() if world_instance.collision_sensor else 0.0
+        accel_vec = player.get_acceleration(); accel_mag = np.sqrt(accel_vec.x**2 + accel_vec.y**2 + accel_vec.z**2)
 
-        collision_intensity = 0.0
-        if world_instance.collision_sensor:
-            collision_hist = world_instance.collision_sensor.get_collision_history()
-            collision_intensity = collision_hist.get(world_instance.hud.frame, 0.0)
-
-        accel_vec = player.get_acceleration()
-        accel_mag = np.sqrt(accel_vec.x**2 + accel_vec.y**2 + accel_vec.z**2)
-
-        data_to_mpc = {
-            'state': current_vehicle_state,
-            'max_steer_rad': max_physical_steer_angle_rad, # For normalization in MPC
-            'collision_intensity': collision_intensity,
-            'accel_magnitude': accel_mag
-        }
+        data_to_mpc = {'state': current_vehicle_state_list, 'max_steer_rad': max_physical_steer_angle_rad,
+                       'collision_intensity': collision_intensity, 'accel_magnitude': accel_mag }
+        
+        # --- Put vehicle data into the send queue (non-blocking) ---
         try:
-            if self.mpc_vehicle_data_pipe_send:
-                 self.mpc_vehicle_data_pipe_send.send(data_to_mpc)
-        except Exception as e:
-            print(f"Android_control: Error sending data to MPC: {e}")
+            self.vehicle_data_send_queue.put_nowait(data_to_mpc)
+        except queue.Full:
+            # print("Android_control: Vehicle data send queue to MPC is full. Frame data might be dropped.")
+            pass 
 
-
-        # --- Receive and Apply Control Command from MPCProcess ---
-        if self.mpc_control_cmd_pipe_recv and self.mpc_control_cmd_pipe_recv.poll(timeout=0.005): # Non-blocking
-            try:
-                mpc_command = self.mpc_control_cmd_pipe_recv.recv()
-                if mpc_command:
-                    # MPCProcess now sends normalized steer
-                    self._control.steer = mpc_command.get('steer', 0.0) 
-                    self._control.throttle = mpc_command.get('throttle', 0.0)
-                    self._control.brake = mpc_command.get('brake', 0.0)
-                    self._control.reverse = mpc_command.get('reverse', False)
-            except EOFError:
-                print("Android_control: MPC control pipe closed.")
-            except Exception as e:
-                print(f"Android_control: Error receiving/processing control from MPC: {e}")
-                # Fallback to safe control if MPC communication fails
-                self._control.steer = 0.0; self._control.throttle = 0.0; self._control.brake = 0.5
+        # --- Check if MPC control is stale (as before) ---
+        with self._data_lock:
+            time_since_last_mpc_update = time.time() - self._last_mpc_control_update_time
+            # Make a copy of the control to apply, to avoid holding lock during apply_control
+            control_to_apply_this_frame = carla.VehicleControl()
+            control_to_apply_this_frame.steer = self._control.steer
+            control_to_apply_this_frame.throttle = self._control.throttle
+            control_to_apply_this_frame.brake = self._control.brake
+            control_to_apply_this_frame.reverse = self._control.reverse
+            control_to_apply_this_frame.manual_gear_shift = self._control.manual_gear_shift
+            control_to_apply_this_frame.gear = self._control.gear
+            
+            if time_since_last_mpc_update > 1.5: 
+                # print(f"Android_control: MPC control data stale ({time_since_last_mpc_update:.2f}s). Applying emergency brake.")
+                control_to_apply_this_frame.steer = 0.0
+                control_to_apply_this_frame.throttle = 0.0
+                control_to_apply_this_frame.brake = 0.8 
 
         # --- Process Keyboard Events for Auxiliary Actions (Unchanged from previous version) ---
         current_lights = self._lights
@@ -442,38 +580,59 @@ class SensorControl(object):
         
         # --- Apply Control if not in Autopilot ---
         if not self._autopilot_enabled and player and player.is_alive:
-            keys = pygame.key.get_pressed()
-            if isinstance(self._control, carla.VehicleControl):
-                 self._control.hand_brake = keys[K_SPACE]
-
+            keys = pygame.key.get_pressed() 
+            # Handbrake still from keyboard
+            control_to_apply_this_frame.hand_brake = keys[K_SPACE] if isinstance(control_to_apply_this_frame, carla.VehicleControl) else False
             try:
-                player.apply_control(self._control)
-                if isinstance(self._control, carla.VehicleControl):
-                    if self._control.brake > 0.1: current_lights |= carla.VehicleLightState.Brake
+                player.apply_control(control_to_apply_this_frame)
+                # Update lights based on the applied control state
+                if isinstance(control_to_apply_this_frame, carla.VehicleControl):
+                    if control_to_apply_this_frame.brake > 0.1: current_lights |= carla.VehicleLightState.Brake
                     else: current_lights &= ~carla.VehicleLightState.Brake
-                    if self._control.reverse: current_lights |= carla.VehicleLightState.Reverse
+                    if control_to_apply_this_frame.reverse: current_lights |= carla.VehicleLightState.Reverse
                     else: current_lights &= ~carla.VehicleLightState.Reverse
                     if current_lights != self._lights:
                         player.set_light_state(carla.VehicleLightState(current_lights))
                         self._lights = current_lights
             except Exception as e:
-                print(f"Error applying control/lights to player {player.id if player else 'N/A'}: {e}")
+                print(f"Android_control: Error applying control/lights: {e}")
+        elif self._autopilot_enabled and player and player.is_alive: 
+             if current_lights != self._lights: # Allow keyboard light changes even in autopilot
+                player.set_light_state(carla.VehicleLightState(current_lights)); self._lights = current_lights
         return False
 
     def stop(self):
         print("Android_control: SensorControl stop called.")
-        if self.mpc_vehicle_data_pipe_send:
-            try:
-                self.mpc_vehicle_data_pipe_send.send(None) # Signal MPC to stop
-                self.mpc_vehicle_data_pipe_send.close()
-            except Exception as e: print(f"Android_control: Error closing MPC send pipe: {e}")
-        if self.mpc_control_cmd_pipe_recv:
-             try: self.mpc_control_cmd_pipe_recv.close()
-             except Exception as e: print(f"Android_control: Error closing MPC recv pipe: {e}")
+        # Signal and join sender thread
+        self._vehicle_data_sender_running_flag.clear()
+        try: self.vehicle_data_send_queue.put_nowait(None) # Sentinel to unblock queue.get()
+        except queue.Full: pass
+        if hasattr(self, '_vehicle_data_sender_thread') and self._vehicle_data_sender_thread.is_alive():
+            self._vehicle_data_sender_thread.join(timeout=1.0)
+        
+        # Signal and join control command server thread
+        self._control_server_running_flag.clear()
+        if hasattr(self, '_control_server_thread') and self._control_server_thread.is_alive():
+            self._control_server_thread.join(timeout=1.0)
+        
+        # Close client socket for vehicle data
+        if self.vehicle_data_socket_client:
+            try: self.vehicle_data_socket_client.close()
+            except: pass; self.vehicle_data_socket_client = None
+        
+        # Close server socket for control commands (and any active connection)
+        if self.control_cmd_conn:
+            try: self.control_cmd_conn.close()
+            except: pass; self.control_cmd_conn = None
+        if self.control_cmd_socket_server:
+            try: self.control_cmd_socket_server.close()
+            except: pass; self.control_cmd_socket_server = None
+        print("Android_control: SensorControl sockets and threads stopped/closed.")
 
     @staticmethod
     def _is_quit_shortcut(key):
         return (key == K_ESCAPE) or (key == K_q and pygame.key.get_mods() & KMOD_CTRL)
+
 
 
 # ==============================================================================
@@ -506,28 +665,35 @@ class HUD(object): # Definition remains the same as previous refactor
         self.frame = timestamp.frame # Use timestamp.frame directly
         self.simulation_time = timestamp.elapsed_seconds
 
-    def tick(self, world, clock): # world is World instance
-        self._notifications.tick(world, clock)
+    def tick(self, world, clock): # world is an instance of World class
+        self._notifications.tick(world, clock) # Pass world for consistency, though not used by FadingText
         if not self._show_info: return
+        
+        # Ensure world and player are valid before accessing attributes
         if not world or not world.player or not world.player.is_alive:
-             self._info_text = ["Player not available"]; return
+             self._info_text = ["Player not available"] 
+             return
 
-        t = world.player.get_transform(); v = world.player.get_velocity(); c = world.player.get_control()
-        compass = world.imu_sensor.compass if world.imu_sensor else 0.0
-        accelerometer = world.imu_sensor.accelerometer if world.imu_sensor else (0,0,0)
+        t = world.player.get_transform()
+        v = world.player.get_velocity()
+        c = world.player.get_control() 
+
+        compass = world.imu_sensor.compass if world.imu_sensor and world.imu_sensor.sensor else 0.0
+        accelerometer = world.imu_sensor.accelerometer if world.imu_sensor and world.imu_sensor.sensor else (0.0,0.0,0.0)
         
         heading = 'N' if compass > 270.5 or compass < 89.5 else ''
         heading += 'S' if 90.5 < compass < 269.5 else ''
         heading += 'E' if 0.5 < compass < 179.5 else ''
         heading += 'W' if 180.5 < compass < 359.5 else ''
-        
-        colhist = world.collision_sensor.get_collision_history() if world.collision_sensor else {}
-        collision = [colhist.get(x + self.frame - 200, 0) for x in range(0, 200)]
-        max_col = max(1.0, max(collision) if collision else 1.0)
+
+        colhist = world.collision_sensor.get_collision_history() if world.collision_sensor and world.collision_sensor.sensor else {}
+        collision = [colhist.get(x + self.frame - 200, 0.0) for x in range(0, 200)]
+        max_col = max(1.0, max(collision) if collision else 1.0) 
         collision = [x / max_col for x in collision]
-        
+
         vehicles = world.world.get_actors().filter('vehicle.*')
-        gnss_lat, gnss_lon = (world.gnss_sensor.lat, world.gnss_sensor.lon) if world.gnss_sensor else (0.0, 0.0)
+        gnss_lat = world.gnss_sensor.lat if world.gnss_sensor and world.gnss_sensor.sensor else 0.0
+        gnss_lon = world.gnss_sensor.lon if world.gnss_sensor and world.gnss_sensor.sensor else 0.0
 
         self._info_text = [
             'Server:  % 16.0f FPS' % self.server_fps,
@@ -540,15 +706,15 @@ class HUD(object): # Definition remains the same as previous refactor
             'Accelero: (%5.1f,%5.1f,%5.1f)' % accelerometer,
             'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (t.location.x, t.location.y)),
             'GNSS:% 24s' % ('(% 2.6f, % 3.6f)' % (gnss_lat, gnss_lon)),
-            'Height:  % 18.0f m' % t.location.z, ''
-        ]
+            'Height:  % 18.0f m' % t.location.z, '' ]
         if isinstance(c, carla.VehicleControl):
             self._info_text += [
                 ('Throttle:', c.throttle, 0.0, 1.0), ('Steer:', c.steer, -1.0, 1.0),
                 ('Brake:', c.brake, 0.0, 1.0), ('Reverse:', c.reverse),
                 ('Hand brake:', c.hand_brake), ('Manual:', c.manual_gear_shift),
-                'Gear:        %s' % {-1: 'R', 0: 'N'}.get(c.gear, c.gear)
-            ]
+                'Gear:        %s' % {-1: 'R', 0: 'N'}.get(c.gear, c.gear) ]
+            if self._show_ackermann_info:
+                 self._info_text += ['', 'Ackermann Controller:', '  Target speed: % 8.0f km/h' % (3.6*self._ackermann_control.speed)]
         elif isinstance(c, carla.WalkerControl):
             self._info_text += [('Speed:', c.speed, 0.0, 5.556), ('Jump:', c.jump)]
         self._info_text += ['', 'Collision:', collision, '', 'Number of vehicles: % 8d' % len(vehicles)]
@@ -558,8 +724,7 @@ class HUD(object): # Definition remains the same as previous refactor
             vehicles = [(distance(x.get_location()), x) for x in vehicles if x.id != world.player.id]
             for d, vehicle in sorted(vehicles, key=lambda vehicles: vehicles[0]):
                 if d > 200.0: break
-                vehicle_type = get_actor_display_name(vehicle, truncate=22)
-                self._info_text.append('% 4dm %s' % (d, vehicle_type))
+                self._info_text.append('% 4dm %s' % (d, get_actor_display_name(vehicle, truncate=22)))
 
     def show_ackermann_info(self, enabled): self._show_ackermann_info = enabled
     def update_ackermann_control(self, ackermann_control): self._ackermann_control = ackermann_control
@@ -646,9 +811,16 @@ class CollisionSensor(object):
         world = self._parent.get_world(); bp = world.get_blueprint_library().find('sensor.other.collision')
         self.sensor = world.spawn_actor(bp, carla.Transform(), attach_to=self._parent)
         weak_self = weakref.ref(self); self.sensor.listen(lambda event: CollisionSensor._on_collision(weak_self, event))
-    def get_collision_history(self):
+    
+    def get_collision_history(self): # For HUD
         history = collections.defaultdict(int); [history.__setitem__(frame, history[frame]+intensity) for frame, intensity in self.history]
         return history
+
+    def get_collision_intensity(self): # For MPC haptics
+        if not self.history: return 0.0
+        # Return intensity of the most recent collision, or average over a very short window
+        return self.history[-1][1] if self.history else 0.0
+
     @staticmethod
     def _on_collision(weak_self, event):
         self = weak_self();
@@ -656,7 +828,7 @@ class CollisionSensor(object):
         actor_type = get_actor_display_name(event.other_actor); self.hud.notification('Collision with %r' % actor_type)
         impulse = event.normal_impulse; intensity = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
         self.history.append((event.frame, intensity));
-        if len(self.history) > 4000: self.history.pop(0)
+        if len(self.history) > 200: self.history.pop(0) 
 
 class LaneInvasionSensor(object):
     # ... (Keep class implementation as is) ...
@@ -844,21 +1016,19 @@ def game_loop(args):
     original_settings = None
     controller = None
     mpc_process_instance = None
-    ac_to_mpc_pipe_parent, ac_to_mpc_pipe_child = multiprocessing.Pipe()
-    mpc_to_ac_pipe_parent, mpc_to_ac_pipe_child = multiprocessing.Pipe()
 
     try:
         client = carla.Client(args.host, args.port)
         client.set_timeout(20.0)
         sim_world = client.get_world()
-        traffic_manager = client.get_trafficmanager(args.tm_port)
+        traffic_manager = client.get_trafficmanager(args.tm_port) # Ensure TM port is used
 
-        if args.sync:
+        if args.sync: # Synchronous mode setup
             original_settings = sim_world.get_settings()
             settings = sim_world.get_settings()
             if not settings.synchronous_mode:
                 settings.synchronous_mode = True
-                settings.fixed_delta_seconds = args.delta_seconds
+                settings.fixed_delta_seconds = args.delta_seconds # Use arg for delta
             sim_world.apply_settings(settings)
             traffic_manager.set_synchronous_mode(True)
         
@@ -866,50 +1036,55 @@ def game_loop(args):
         display.fill((0,0,0)); pygame.display.flip()
 
         hud = HUD(args.width, args.height)
-        world = World(sim_world, hud, traffic_manager, args)
+        world = World(sim_world, hud, traffic_manager, args) # Pass TM to World
 
-        mpc_params = {'horizon_N': 10, 'dt': args.delta_seconds if args.sync else 0.05, 'wheelbase': 2.5} # Example wheelbase
+        # MPC Process Setup
+        mpc_params = {'horizon_N': 10, 'dt': args.delta_seconds if args.sync else 0.017, 'wheelbase': 2.5}
         phone_tcp_config = {"host": args.mpc_phone_host, "port": args.mpc_phone_port}
-        control_config = {
+        control_config = { # Pass all relevant control tuning parameters from args
             "steer_angle_sensitivity": args.steer_angle_sensitivity,
             "steering_angle_deadzone": args.steering_angle_deadzone,
-            "max_vehicle_steer_angle_deg": args.max_vehicle_steer_angle_deg, # Used by MPCProcess for normalization
+            "max_vehicle_steer_angle_deg": args.max_vehicle_steer_angle_deg,
             "steer_rate_sensitivity": args.steer_rate_sensitivity,
             "steering_rate_deadzone": args.steering_rate_deadzone,
             "max_vehicle_steer_rate_deg_s": args.max_vehicle_steer_rate_deg_s,
             "max_ay_for_scaling": args.max_ay_for_scaling,
             "max_gz_for_scaling_rps": args.max_gz_for_scaling_rps,
-            # "max_speed_kph": args.max_speed_kph, # Speed limit removed from MPCProcess
             "haptic_collision_threshold": args.haptic_collision_threshold,
-            "haptic_accel_threshold": args.haptic_accel_threshold
+            "haptic_accel_threshold": args.haptic_accel_threshold,
+            "data_history_size": args.data_history_size
         }
+        
+        vehicle_data_server_addr = (args.ipc_host, args.ipc_vehicle_data_port)
+        control_cmd_client_addr = (args.ipc_host, args.ipc_control_cmd_port)
 
         mpc_process_instance = MPCProcess(
-            ac_to_mpc_pipe_child, mpc_to_ac_pipe_parent, 
-            mpc_params, phone_tcp_config, control_config
+            mpc_params, phone_tcp_config, control_config,
+            vehicle_data_server_address=vehicle_data_server_addr,
+            control_cmd_client_address=control_cmd_client_addr
         )
         mpc_process_instance.start()
         print("Game_loop: MPC Process started.")
 
-        controller = SensorControl(world, args.autopilot, ac_to_mpc_pipe_parent, mpc_to_ac_pipe_child)
+        # SensorControl now uses socket addresses
+        controller = SensorControl(world, args.autopilot,
+                                   mpc_vehicle_data_address=vehicle_data_server_addr,
+                                   control_cmd_server_address=control_cmd_client_addr)
 
         if args.sync: sim_world.tick()
         else: sim_world.wait_for_tick()
 
         clock = pygame.time.Clock()
         while True:
-            if args.sync:
-                sim_world.tick(); clock.tick() 
-            else:
-                 clock.tick_busy_loop(60)
+            if args.sync: sim_world.tick(); clock.tick() 
+            else: clock.tick_busy_loop(60) # Limit client FPS if async
 
             if not mpc_process_instance.is_alive() and mpc_process_instance.exitcode is not None:
                 print(f"Game_loop: MPC process has exited with code {mpc_process_instance.exitcode}. Stopping.")
                 break
             
-            if controller.parse_events(client, world, clock, args.sync):
-                break 
-
+            if controller.parse_events(client, world, clock, args.sync): break 
+            
             if world: world.tick(clock)
             if world: world.render(display)
             pygame.display.flip()
@@ -922,22 +1097,12 @@ def game_loop(args):
 
         if mpc_process_instance:
             print("Game_loop: Signaling MPC process to stop...")
-            if ac_to_mpc_pipe_parent and not ac_to_mpc_pipe_parent.closed:
-                try: ac_to_mpc_pipe_parent.send(None)
-                except Exception as e: print(f"Game_loop: Error sending stop signal to MPC via pipe: {e}")
-            
-            if mpc_process_instance.is_alive():
-                mpc_process_instance.join(timeout=2.0)
+            mpc_process_instance.stop() 
+            if mpc_process_instance.is_alive(): mpc_process_instance.join(timeout=2.0)
             if mpc_process_instance.is_alive():
                 print("Game_loop: MPC process did not exit cleanly, terminating.")
-                mpc_process_instance.terminate()
-                mpc_process_instance.join(timeout=1.0) # Wait for termination
+                mpc_process_instance.terminate(); mpc_process_instance.join(timeout=1.0)
         print("Game_loop: MPC Process cleanup attempt finished.")
-
-        # Close parent ends of pipes
-        if ac_to_mpc_pipe_parent and not ac_to_mpc_pipe_parent.closed: ac_to_mpc_pipe_parent.close()
-        if mpc_to_ac_pipe_child and not mpc_to_ac_pipe_child.closed: mpc_to_ac_pipe_child.close()
-
 
         if original_settings and sim_world:
              try: sim_world.apply_settings(original_settings)
@@ -973,6 +1138,11 @@ def main():
     argparser.add_argument('--mpc_phone_host', default='0.0.0.0', help='Host for MPC to listen for phone data (default: 0.0.0.0 to listen on all interfaces)')
     argparser.add_argument('--mpc_phone_port', default=6002, type=int, help='Port for MPC to listen for phone data (default: 6002)')
 
+    # NEW ARGS for IPC Sockets
+    argparser.add_argument('--ipc_host', default='127.0.0.1', help='Host for IPC sockets between Android_control and MPC (default: 127.0.0.1)')
+    argparser.add_argument('--ipc_vehicle_data_port', default=6003, type=int, help='Port for Android_control to send vehicle data to MPC (default: 6003)')
+    argparser.add_argument('--ipc_control_cmd_port', default=6004, type=int, help='Port for MPC to send control commands to Android_control (default: 6004)')
+
     # Args for control_config (passed to MPCProcess)
     argparser.add_argument('--steer_angle_sensitivity', default=0.7, type=float, help='Sensitivity for AY to desired steer angle.')
     argparser.add_argument('--steering_angle_deadzone', default=0.2, type=float, help='Deadzone for AY for steering angle (m/s^2).')
@@ -985,6 +1155,7 @@ def main():
     argparser.add_argument('--max_speed_kph', default=0, type=float, help='Vehicle speed limit (kph). 0 for blueprint default. (REMOVED from MPCProcess, handled by World/Player)')
     argparser.add_argument('--haptic_collision_threshold', default=0.5, type=float, help='Collision intensity threshold for haptic feedback.')
     argparser.add_argument('--haptic_accel_threshold', default=7.0, type=float, help='Vehicle acceleration magnitude threshold for haptic feedback (m/s^2).')
+    argparser.add_argument('--data_history_size', default=5, type=int, help="Number of samples for WMA filter in MPC.")
 
 
     args = argparser.parse_args()
@@ -1001,5 +1172,6 @@ def main():
     except Exception as e: logging.critical("Unhandled exception in main: %s", e); traceback.print_exc()
 
 if __name__ == '__main__':
+    # multiprocessing.freeze_support() 
     main()
 
