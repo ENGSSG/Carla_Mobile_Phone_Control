@@ -1005,7 +1005,7 @@ class CameraManager(object):
             self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
         if self.recording: image.save_to_disk('_out/%08d' % image.frame)
 
-
+FIXED_SIMULATION_STEP_TIME = 0.017
 # ==============================================================================
 # -- game_loop() (Updated for MPC Process) -------------------------------------
 # ==============================================================================
@@ -1023,20 +1023,31 @@ def game_loop(args):
         sim_world = client.get_world()
         traffic_manager = client.get_trafficmanager(args.tm_port) # Ensure TM port is used
 
-        if args.sync: # Synchronous mode setup
-            original_settings = sim_world.get_settings()
-            settings = sim_world.get_settings()
-            if not settings.synchronous_mode:
-                settings.synchronous_mode = True
-                settings.fixed_delta_seconds = args.delta_seconds # Use arg for delta
+        if args.sync:
+            original_settings = sim_world.get_settings(); settings = sim_world.get_settings()
+            current_fixed_delta_seconds = FIXED_SIMULATION_STEP_TIME 
+            if current_fixed_delta_seconds <= 0: current_fixed_delta_seconds = 0.05
+            settings.synchronous_mode = True; settings.fixed_delta_seconds = current_fixed_delta_seconds
             sim_world.apply_settings(settings)
-            traffic_manager.set_synchronous_mode(True)
+            if hasattr(traffic_manager, 'set_synchronous_mode'): traffic_manager.set_synchronous_mode(True)
+            target_fps_for_client = 1.0 / current_fixed_delta_seconds
+            print(f"Synchronous mode: Server fixed_delta_seconds = {current_fixed_delta_seconds:.4f}s. Client target FPS = {target_fps_for_client:.2f}")
+        
         
         display = pygame.display.set_mode((args.width, args.height), pygame.HWSURFACE | pygame.DOUBLEBUF)
         display.fill((0,0,0)); pygame.display.flip()
 
         hud = HUD(args.width, args.height)
         world = World(sim_world, hud, traffic_manager, args) # Pass TM to World
+
+        # MPC Process Setup
+        mpc_dt = FIXED_SIMULATION_STEP_TIME if args.sync else 0.05
+        mpc_params = {'horizon_N': 10, 'dt': mpc_dt, 'wheelbase': 2.5}
+        phone_tcp_config = {"host": args.mpc_phone_host, "port": args.mpc_phone_port}
+        
+        max_speed_mps_limit = 0.0
+        if args.max_speed_kph > 0:
+            max_speed_mps_limit = args.max_speed_kph / 3.6
 
         # MPC Process Setup
         mpc_params = {'horizon_N': 10, 'dt': args.delta_seconds if args.sync else 0.05, 'wheelbase': 2.5}
@@ -1052,7 +1063,14 @@ def game_loop(args):
             "max_gz_for_scaling_rps": args.max_gz_for_scaling_rps,
             "haptic_collision_threshold": args.haptic_collision_threshold,
             "haptic_accel_threshold": args.haptic_accel_threshold,
-            "data_history_size": args.data_history_size
+            "data_history_size": args.data_history_size,
+            "max_speed_mps": max_speed_mps_limit,
+            # ---- New Config for Gradual Throttle & PID ----
+            "throttle_increase_rate": args.throttle_increase_rate,
+            "throttle_decrease_rate": args.throttle_decrease_rate,
+            "pid_kp": args.pid_kp,
+            "pid_ki": args.pid_ki,
+            "pid_kd": args.pid_kd
         }
         
         vehicle_data_server_addr = (args.ipc_host, args.ipc_vehicle_data_port)
@@ -1156,6 +1174,14 @@ def main():
     argparser.add_argument('--haptic_collision_threshold', default=0.5, type=float, help='Collision intensity threshold for haptic feedback.')
     argparser.add_argument('--haptic_accel_threshold', default=7.0, type=float, help='Vehicle acceleration magnitude threshold for haptic feedback (m/s^2).')
     argparser.add_argument('--data_history_size', default=5, type=int, help="Number of samples for WMA filter in MPC.")
+
+    # ---- New Args for Gradual Throttle & PID ----
+    argparser.add_argument('--throttle_increase_rate', default=0.5, type=float, help='Rate at which throttle increases (units/sec) when accel is pressed.')
+    argparser.add_argument('--throttle_decrease_rate', default=1.0, type=float, help='Rate at which throttle decreases (units/sec) when accel is released.')
+    argparser.add_argument('--pid_kp', default=0.6, type=float, help='PID Proportional gain for speed control.') # Tuned Kp
+    argparser.add_argument('--pid_ki', default=0.15, type=float, help='PID Integral gain for speed control.')    # Tuned Ki
+    argparser.add_argument('--pid_kd', default=0.08, type=float, help='PID Derivative gain for speed control.')  # Tuned Kd
+
 
 
     args = argparser.parse_args()

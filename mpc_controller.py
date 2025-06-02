@@ -10,6 +10,58 @@ import collections # For deque
 import json
 
 # from scipy.optimize import minimize # Example using SciPy (Commented out)
+class PIDController:
+    def __init__(self, Kp, Ki, Kd, setpoint, dt, output_limits=(-1.0, 1.0), integral_limits=(-5.0, 5.0)):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.setpoint = setpoint  # Target speed
+        self.dt = dt              # Time step
+
+        self.integral = 0.0
+        self.previous_error = 0.0
+        
+        self.output_min, self.output_max = output_limits
+        self.integral_min, self.integral_max = integral_limits # Anti-windup for integral term
+        
+        print(f"PID Initialized: Kp={Kp}, Ki={Ki}, Kd={Kd}, Setpoint={setpoint}, dt={dt}, OutLimits={output_limits}, IntLimits={integral_limits}")
+
+
+    def update(self, current_value):
+        if self.dt <= 0: return 0.0 # Avoid division by zero if dt is invalid
+        error = self.setpoint - current_value
+        
+        # Proportional term
+        P_out = self.Kp * error
+        
+        # Integral term (with anti-windup)
+        self.integral += error * self.dt
+        self.integral = np.clip(self.integral, self.integral_min, self.integral_max)
+        I_out = self.Ki * self.integral
+        
+        # Derivative term
+        derivative = (error - self.previous_error) / self.dt
+        D_out = self.Kd * derivative
+        
+        # Total output
+        output = P_out + I_out + D_out
+        
+        # Update previous error
+        self.previous_error = error
+        
+        # Clip output
+        return np.clip(output, self.output_min, self.output_max)
+
+    def reset(self):
+        self.integral = 0.0
+        self.previous_error = 0.0
+        print(f"PID Reset. Setpoint: {self.setpoint}")
+
+    def set_setpoint(self, setpoint):
+        if self.setpoint != setpoint:
+            print(f"PID Setpoint Changed: Old={self.setpoint}, New={setpoint}")
+            self.setpoint = setpoint
+            self.reset() # Reset PID when setpoint changes
 
 def vehicle_model(state, control_input, dt):
     """
@@ -288,6 +340,35 @@ class MPCProcess(multiprocessing.Process):
         )
         self.running = True # Controls the main run loop of MPCProcess
 
+        # ---- New for Gradual Throttle ----
+        self.current_applied_throttle_user = 0.0 # User's desired throttle after ramping
+        self.throttle_increase_rate = self.control_config.get('throttle_increase_rate', 0.5) # units/sec
+        self.throttle_decrease_rate = self.control_config.get('throttle_decrease_rate', 1.0) # units/sec
+
+        # ---- New for PID Speed Control ----
+        self.pid_speed_controller = None
+        self.target_speed_mps = self.control_config.get('max_speed_mps', 0.0) # Target speed for PID
+
+        pid_kp = self.control_config.get('pid_kp', 0.5)
+        pid_ki = self.control_config.get('pid_ki', 0.1)
+        pid_kd = self.control_config.get('pid_kd', 0.05)
+        pid_dt = self.mpc_controller.dt # Use MPC's dt for PID updates
+
+        if self.target_speed_mps > 0 and pid_dt > 0:
+            self.pid_speed_controller = PIDController(
+                Kp=pid_kp, Ki=pid_ki, Kd=pid_kd,
+                setpoint=self.target_speed_mps,
+                dt=pid_dt,
+                output_limits=(-1.0, 1.0), # PID output: -1 (max brake) to 1 (max throttle)
+                integral_limits=(-2.0, 2.0) # Example integral limits for anti-windup
+            )
+            print(f"MPCProcess: PID Speed Controller enabled for target {self.target_speed_mps:.2f} m/s.")
+        else:
+            print(f"MPCProcess: PID Speed Controller disabled (target_speed_mps={self.target_speed_mps}, pid_dt={pid_dt}).")
+
+        self.running = True
+
+
     def _setup_vehicle_data_server(self):
         """Sets up the TCP server to listen for vehicle data from Android_control.py."""
         try:
@@ -422,17 +503,11 @@ class MPCProcess(multiprocessing.Process):
     def run(self):
         print("MPC_Process: Starting PhoneSensorListener thread...")
         self.phone_listener.start()
-        
-        if not self._setup_vehicle_data_server():
-            print("MPC_Process: Failed to start vehicle data server. Exiting.")
-            self.running = False
-        
-        # Initial connection attempt for control commands
-        if self.running:
-            self._connect_control_cmd_client()
-
+        if not self._setup_vehicle_data_server(): self.running = False
+        if self.running: self._connect_control_cmd_client()
         print("MPC_Process: MPC run loop started.")
-        default_vehicle_state_vec = np.zeros(5) # Example, ensure correct size
+        
+        dt = self.mpc_controller.dt # Get time step for physics updates
 
         try:
             while self.running:
@@ -459,7 +534,7 @@ class MPCProcess(multiprocessing.Process):
                 raw_vehicle_state = np.array(vehicle_data_from_main['state'])
                 self.vehicle_state_history.append(raw_vehicle_state)
                 processed_vehicle_state = self._calculate_vector_wma(self.vehicle_state_history, default_vector=raw_vehicle_state)
-                
+                current_speed_mps = processed_vehicle_state[3] # Speed is at index 3
                 max_physical_steer_angle_rad = vehicle_data_from_main.get('max_steer_rad', np.radians(70.0))
                 haptic_collision_intensity = vehicle_data_from_main.get('collision_intensity', 0.0)
                 haptic_accel_magnitude = vehicle_data_from_main.get('accel_magnitude', 0.0)
@@ -467,8 +542,8 @@ class MPCProcess(multiprocessing.Process):
                 with self._phone_data_lock:
                     processed_ay = self._calculate_wma(self.ay_history, default_value=self.ay_data_phone)
                     processed_gz = self._calculate_wma(self.gz_history, default_value=self.gz_data_phone)
-                    accel_pressed = self.accelerate_pressed_phone
-                    brake_pressed = self.brake_pressed_phone
+                    accel_button_pressed = self.accelerate_pressed_phone == 1
+                    brake_button_pressed = self.brake_pressed_phone == 1
                     reverse_active = self.reverse_enabled_phone
                     is_phone_currently_connected = self._is_phone_connected
                     last_phone_update_current = self._last_phone_update_time
@@ -518,8 +593,8 @@ class MPCProcess(multiprocessing.Process):
                         desired_steer_rate_rps = math.copysign(scaled_input_rate, -processed_gz) * sr_sens * max_veh_steer_rate_rps
                         desired_steer_rate_rps = np.clip(desired_steer_rate_rps, -max_veh_steer_rate_rps, max_veh_steer_rate_rps)
                     
-                    throttle_cmd = 1.0 if accel_pressed == 1 else 0.0
-                    brake_cmd = 1.0 if brake_pressed == 1 else 0.0
+                    throttle_cmd = 1.0 if accel_button_pressed == 1 else 0.0
+                    brake_cmd = 1.0 if brake_button_pressed == 1 else 0.0
                     if brake_cmd > 0.0: throttle_cmd = 0.0 # Prioritize braking
                 
                 optimal_target_steer_angle_rad = self.mpc_controller.compute_steering_command(
@@ -529,10 +604,91 @@ class MPCProcess(multiprocessing.Process):
                 normalized_steer_cmd = 0.0
                 if abs(max_physical_steer_angle_rad) > 1e-4: # Avoid division by zero
                     normalized_steer_cmd = np.clip(optimal_target_steer_angle_rad / max_physical_steer_angle_rad, -1.0, 1.0)
+
+                
+                # --- Gradual Throttle Logic ---
+                if accel_button_pressed and not brake_button_pressed:
+                    self.current_applied_throttle_user += self.throttle_increase_rate * dt
+                else: # Ramp down if accel not pressed OR if brake is pressed
+                    self.current_applied_throttle_user -= self.throttle_decrease_rate * dt
+                self.current_applied_throttle_user = np.clip(self.current_applied_throttle_user, 0.0, 1.0)
+
+
+                # User's direct intention for throttle and brake
+                user_throttle_request = self.current_applied_throttle_user
+                user_brake_request = 1.0 if brake_button_pressed else 0.0
+                if user_brake_request > 0: # If user brakes, ramped throttle is cut
+                    user_throttle_request = 0.0
+                    self.current_applied_throttle_user = 0.0 # Reset ramp
+
+                # Initialize final commands
+                final_throttle_cmd = user_throttle_request
+                final_brake_cmd = user_brake_request
+                
+                # --- PID Speed Control Logic (acts as a limiter) ---
+                if self.pid_speed_controller and self.target_speed_mps > 0:
+                    if self.pid_speed_controller.setpoint != self.target_speed_mps:
+                        self.pid_speed_controller.set_setpoint(self.target_speed_mps)
+                    
+                    pid_output = self.pid_speed_controller.update(current_speed_mps)
+
+                    if user_brake_request > 0: 
+                        # User braking always overrides PID.
+                        # final_throttle_cmd is already 0 from above.
+                        # final_brake_cmd is already user_brake_request.
+                        self.pid_speed_controller.reset() 
+                        # self.current_applied_throttle_user was already reset.
+                    else: # No user braking, PID can influence.
+                        # Condition for PID to actively limit/control:
+                        # - If speed is over the target OR
+                        # - If speed is very close to target and user is still trying to accelerate OR
+                        # - If user is not providing throttle input (coasting) and speed needs adjustment by PID.
+                        
+                        # Let PID primarily act if speed is above or very near the setpoint.
+                        if current_speed_mps > self.target_speed_mps: # Overspeeding
+                            final_throttle_cmd = 0.0 # Definitely cut throttle
+                            if pid_output < 0: # PID wants to brake
+                                final_brake_cmd = max(final_brake_cmd, np.clip(-pid_output, 0.0, 1.0))
+                            self.current_applied_throttle_user = 0.0 # Reflect that throttle is cut
+                            
+                        elif current_speed_mps > self.target_speed_mps - 1.0: # Approaching limit (e.g., within 1 m/s)
+                            # If PID suggests throttling down or braking, respect that.
+                            if pid_output < user_throttle_request : # PID wants less throttle than user or wants to brake
+                                if pid_output >= 0: # PID wants some throttle, but less than user
+                                    final_throttle_cmd = np.clip(pid_output, 0.0, 1.0)
+                                else: # PID wants to brake
+                                    final_throttle_cmd = 0.0
+                                    final_brake_cmd = max(final_brake_cmd, np.clip(-pid_output, 0.0, 1.0))
+                                # Sync user ramp if PID is reducing throttle
+                                self.current_applied_throttle_user = final_throttle_cmd
+                        
+                        # If user is not accelerating (user_throttle_request is 0 or very low)
+                        # and speed is below target, PID can apply gentle throttle to maintain speed (e.g., uphill/downhill).
+                        # This prevents unwanted strong acceleration if user is just coasting.
+                        # elif user_throttle_request < 0.1 and current_speed_mps < self.target_speed_mps :
+                        #      if pid_output > 0: # PID wants to apply throttle to maintain speed
+                        #          # Apply only a small portion of PID's throttle if user isn't actively accelerating
+                        #          # This is to counteract drag/hills, not to aggressively accelerate.
+                        #          maintenance_throttle = np.clip(pid_output, 0.0, 0.3) # Max 30% throttle for maintenance
+                        #          final_throttle_cmd = max(final_throttle_cmd, maintenance_throttle) # Ensure it doesn't override user's small throttle
+                
+                
+                # --- Handle Phone Disconnection / Stale Data (Overrides PID/User) ---
+                if not is_phone_currently_connected or time.time() - last_phone_update_current > 2.0:
+                    if is_phone_currently_connected: 
+                        print("MPC_Process: Phone data stale. Applying emergency brakes.")
+                        self._update_local_phone_sensor_data(0.0,0.0,0,0,reverse_active,False) 
+                    final_throttle_cmd = 0.0; final_brake_cmd = 0.8 
+                    self.current_applied_throttle_user = 0.0 
+                    if self.pid_speed_controller: self.pid_speed_controller.reset() 
+
+                
                 
                 control_output = {
-                    'steer': normalized_steer_cmd, 'throttle': throttle_cmd,
-                    'brake': brake_cmd, 'reverse': reverse_active
+                    'steer': normalized_steer_cmd, 
+                    'throttle': final_throttle_cmd,
+                    'brake': final_brake_cmd, 
+                    'reverse': reverse_active 
                 }
                 if not self._send_control_command(control_output):
                     print("MPC_Process: Failed to send control command. Will retry connection on next cycle.")
