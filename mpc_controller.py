@@ -8,6 +8,89 @@ import numpy as np
 import math
 import collections # For deque
 import json
+import cv2
+
+class CameraStreamListener(threading.Thread):
+    """Handles TCP communication to receive camera frames."""
+    def __init__(self, host, port, data_lock, frame_update_callback, running_flag_event):
+        super().__init__(daemon=True)
+        self.host = host
+        self.port = port
+        self.data_lock = data_lock
+        self.frame_update_callback = frame_update_callback
+        self.running_flag = running_flag_event
+        self.client_conn = None
+        print(f"CameraStreamListener: Initialized for {host}:{port}")
+
+    def _read_all(self, n):
+        """Helper function to ensure all n bytes are read from the socket."""
+        data = bytearray()
+        while len(data) < n:
+            packet = self.client_conn.recv(n - len(data))
+            if not packet:
+                return None
+            data.extend(packet)
+        return data
+
+    def run(self):
+        server_socket = None
+        try:
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_socket.bind((self.host, self.port))
+            server_socket.listen(1)
+            print(f"CameraStreamListener: Socket bound and listening on {self.host}:{self.port}")
+        except Exception as e:
+            print(f"CameraStreamListener: Error setting up socket: {e}"); traceback.print_exc()
+            if server_socket: server_socket.close()
+            self.running_flag.clear(); return
+
+        while self.running_flag.is_set():
+            try:
+                server_socket.settimeout(1.0)
+                self.client_conn, addr = server_socket.accept()
+                self.client_conn.settimeout(5.0)
+                print(f"CameraStreamListener: Connection from {addr}")
+
+                while self.running_flag.is_set():
+                    # 1. Read the 4-byte size header
+                    raw_msg_len = self._read_all(4)
+                    if not raw_msg_len:
+                        print(f"CameraStreamListener: Client {addr} disconnected (header).")
+                        break
+                    msg_len = int.from_bytes(raw_msg_len, 'big')
+
+                    # 2. Read the full image data
+                    img_data = self._read_all(msg_len)
+                    if not img_data:
+                        print(f"CameraStreamListener: Client {addr} disconnected (payload).")
+                        break
+
+                    # 3. Decode the image and call the callback
+                    try:
+                        img_np = np.frombuffer(img_data, np.uint8)
+                        frame = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+                        if frame is not None:
+                            self.frame_update_callback(frame)
+                    except Exception as e:
+                        print(f"CameraStreamListener: Could not decode image: {e}")
+
+            except socket.timeout:
+                continue
+            except (socket.error, ConnectionResetError) as e:
+                print(f"CameraStreamListener: Socket error/reset with {addr if 'addr' in locals() else 'N/A'}: {e}")
+            except Exception as e:
+                print(f"CameraStreamListener: Error in accept/outer loop: {e}")
+                traceback.print_exc()
+                time.sleep(1)
+            finally:
+                if self.client_conn:
+                    try: self.client_conn.close()
+                    except: pass
+                    self.client_conn = None
+        
+        print("CameraStreamListener: Thread stopping.")
+        if server_socket: server_socket.close()
 
 # from scipy.optimize import minimize # Example using SciPy (Commented out)
 class PIDController:
@@ -55,7 +138,7 @@ class PIDController:
     def reset(self):
         self.integral = 0.0
         self.previous_error = 0.0
-        print(f"PID Reset. Setpoint: {self.setpoint}")
+        # print(f"PID Reset. Setpoint: {self.setpoint}")
 
     def set_setpoint(self, setpoint):
         if self.setpoint != setpoint:
@@ -95,6 +178,119 @@ def vehicle_model(state, control_input, dt):
 
     return np.array([new_x, new_y, new_yaw, new_v, new_delta])
 
+
+
+class LaneKeepingAssist:
+    def __init__(self, dt, kp=0.005, ki=0.0001, kd=0.002):
+        """
+        Initializes the LKA system using the generic PIDController.
+        :param dt: The time step (delta time) for the PID derivative calculation.
+        :param kp, ki, kd: PID gains tuned for steering correction based on pixel error.
+        """
+        # The "setpoint" for our LKA's PID controller is an error of 0.
+        # We want the difference between the lane center and the vehicle center to be zero.
+        setpoint = 0.0
+        
+        self.pid_controller = PIDController(
+            Kp=kp,
+            Ki=ki,
+            Kd=kd,
+            setpoint=setpoint,
+            dt=dt,
+            output_limits=(-1.0, 1.0),  # Output is a normalized steering command
+            integral_limits=(-150.0, 150.0) # Integral limit based on pixel error magnitude
+        )
+        print(f"LKA Initialized using shared PIDController class. Kp={kp}, Ki={ki}, Kd={kd}")
+
+    def process_frame(self, frame):
+        """
+        Processes a single camera frame to find lane lines and calculate steering correction.
+        Returns a steering correction value between -1.0 (steer left) and 1.0 (steer right).
+        """
+        if frame is None:
+            self.pid_controller.reset() # Reset PID if we lose sight of lines
+            return 0.0,None
+
+        h, w, _ = frame.shape
+        
+        # 1. Image processing (ROI, grayscale, blur, Canny, Hough)
+        # This part remains exactly the same.
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (13, 13), 0)
+        edges = cv2.Canny(blur, 50, 150)
+        roi_vertices = np.array([[(0, h), (w/2, h/2), (w, h)]], dtype=np.int32)
+        mask = np.zeros_like(edges)
+        cv2.fillPoly(mask, roi_vertices, 255)
+        masked_image = cv2.bitwise_and(edges, mask)
+        lines = cv2.HoughLinesP(masked_image, 1, np.pi/180, 50, minLineLength=40, maxLineGap=150)
+        
+        if lines is None:
+            self.pid_controller.reset() # Reset PID if we lose sight of lines
+            return 0.0,frame
+
+        # 2. Separate and Average Lines (This part is the same)
+        left_lines, right_lines = [], []
+        for line in lines:
+            for x1, y1, x2, y2 in line:
+                if x2 == x1: 
+                    continue
+                slope = (y2 - y1) / (x2 - x1)
+                if abs(slope) < 0.7: 
+                    continue
+                if slope < 0: 
+                    left_lines.append(line)
+                else: 
+                    right_lines.append(line)
+                display = cv2.line(frame,(x1,y1),(x2,y2),(0,255,255),2)
+            
+
+        def get_line_x(lines, y):
+            if not lines: return None
+            x_intercepts = []
+            for line in lines:
+                for x1, y1, x2, y2 in line:
+                    if y2-y1 == 0: 
+                        continue
+                    x = int(x1 + (x2-x1) * (y-y1) / (y2-y1))
+                    x_intercepts.append(x)
+            return int(np.mean(x_intercepts)) if x_intercepts else None
+
+        y_eval = int(h * 0.8)
+        left_x = get_line_x(left_lines, y_eval)
+        right_x = get_line_x(right_lines, y_eval)
+
+        if left_x is None or right_x is None:
+            self.pid_controller.reset() # Reset PID if we lose one or both lines
+            return 0.0, frame
+
+        # 3. Calculate Error
+        lane_center_x = (left_x + right_x) / 2
+        vehicle_center_x = w / 2
+        
+        # The error is the deviation from the center in pixels.
+        # Positive error = vehicle is to the left of the lane center, needs to steer right.
+        error = lane_center_x - vehicle_center_x
+        
+        # 4. Get Correction from the PID Controller
+        # The PID controller's job is to drive the `error` (current_value) to its `setpoint` (0.0).
+        # We need to flip the sign of the error because a positive error (vehicle left of center)
+        # should result in a positive steering command (steer right). The PID controller will
+        # output a value to counteract the error. Let's adjust how we feed it.
+        # PID input error = setpoint - current_value = 0.0 - error
+        # So we just pass `error` to the update function, which will internally calculate `0 - error`.
+        # However, the PID formula is `Kp * error...`. Let's trace it:
+        # If vehicle is LEFT of center, `lane_center_x` > `vehicle_center_x`, so `error` is POSITIVE.
+        # We need a POSITIVE steering command (steer right).
+        # The PID `update` method calculates `setpoint - current_value`. If we pass our `error` as `current_value`,
+        # it will calculate `0 - error`, which is NEGATIVE. The output will be negative.
+        # So, we should pass `-error` as the `current_value` to get the correct sign.
+        
+        current_value_for_pid = -error
+        steering_correction = self.pid_controller.update(current_value_for_pid)
+
+        return steering_correction,display
+    
 class MPCController:
     """
     Core MPC logic.
@@ -308,7 +504,9 @@ class PhoneSensorListener(threading.Thread):
 class MPCProcess(multiprocessing.Process):
     def __init__(self, mpc_params, phone_tcp_config, control_config,
                  vehicle_data_server_address=('127.0.0.1', 6003),
-                 control_cmd_client_address=('127.0.0.1', 6004)):
+                 control_cmd_client_address=('127.0.0.1', 6004),
+                 image_data_server_address = ('127.0.0.1', 6005)):
+        
         super().__init__()
         self.mpc_controller = MPCController(**mpc_params)
         self.control_config = control_config
@@ -340,6 +538,18 @@ class MPCProcess(multiprocessing.Process):
         )
         self.running = True # Controls the main run loop of MPCProcess
 
+        # --- New for LKA and Camera ---
+        self.latest_camera_frame = None
+        self._camera_data_lock = threading.Lock()
+        self._camera_listener_running_flag = threading.Event(); self._camera_listener_running_flag.set()
+        self.camera_listener = CameraStreamListener(
+            host=image_data_server_address[0],
+            port=image_data_server_address[1],
+            data_lock=self._camera_data_lock,
+            frame_update_callback=self._update_local_camera_frame,
+            running_flag_event=self._camera_listener_running_flag
+        )
+
         # ---- New for Gradual Throttle ----
         self.current_applied_throttle_user = 0.0 # User's desired throttle after ramping
         self.throttle_increase_rate = self.control_config.get('throttle_increase_rate', 0.5) # units/sec
@@ -367,7 +577,10 @@ class MPCProcess(multiprocessing.Process):
             print(f"MPCProcess: PID Speed Controller disabled (target_speed_mps={self.target_speed_mps}, pid_dt={pid_dt}).")
 
         self.running = True
-
+    # Add the callback method
+    def _update_local_camera_frame(self, frame):
+        with self._camera_data_lock:
+            self.latest_camera_frame = frame
 
     def _setup_vehicle_data_server(self):
         """Sets up the TCP server to listen for vehicle data from Android_control.py."""
@@ -503,11 +716,23 @@ class MPCProcess(multiprocessing.Process):
     def run(self):
         print("MPC_Process: Starting PhoneSensorListener thread...")
         self.phone_listener.start()
+                # --- NEW: Start camera listener thread ---
+        print("MPC_Process: Starting CameraStreamListener thread...")
+        self.camera_listener.start()
         if not self._setup_vehicle_data_server(): self.running = False
         if self.running: self._connect_control_cmd_client()
         print("MPC_Process: MPC run loop started.")
         
         dt = self.mpc_controller.dt # Get time step for physics updates
+            # --- LKA Setup ---
+        # FIX: Pass the dt to the constructor
+        lka_controller = LaneKeepingAssist(dt=dt) 
+        lka_enabled = False
+        lka_strength = 0.2 # Increased strength for better testing
+        # Debugging counter
+        frame_process_count = 0
+        last_print_time = time.time()
+
 
         try:
             while self.running:
@@ -530,6 +755,50 @@ class MPCProcess(multiprocessing.Process):
                              print("MPC_Process: Failed to send emergency brake. Retrying control cmd connection.")
                              self._connect_control_cmd_client()
                     continue
+                # --- LKA Toggle Logic ---
+                if vehicle_data_from_main and vehicle_data_from_main.get('lka_toggle_request'):
+                    lka_enabled = not lka_enabled
+                    print(f"--- LKA TOGGLE RECEIVED --- New state: {'ENABLED' if lka_enabled else 'DISABLED'} ---")
+                    self.phone_listener.send_haptic_feedback(f"LKA,{'1' if lka_enabled else '0'}\n")
+
+                # --- LKA Processing ---
+                lka_steering_correction_norm = 0.0 # Normalized -1 to 1
+                if lka_enabled:
+                    with self._camera_data_lock:
+                        current_frame = self.latest_camera_frame
+                    
+                    if current_frame is not None:
+                        lka_steering_correction_norm, lines= lka_controller.process_frame(current_frame)
+                        # For debugging, you can show the processed frame
+                        cv2.imshow('lines', lines)
+                        cv2.waitKey(1)
+
+                
+                # # --- DEBUG POINT 2: Check if LKA is enabled ---
+                # if lka_enabled:
+                #     with self._camera_data_lock:
+                #         current_frame = self.latest_camera_frame
+                    
+                #     # --- DEBUG POINT 3: Check if a frame has been received ---
+                #     if current_frame is not None:
+                #         # This is the core block. If we get here, the camera stream is working.
+                #         lka_steering_correction_norm = lka_controller.process_frame(current_frame)
+                #         frame_process_count += 1
+                        
+                #         # --- DEBUG POINT 4: Print status periodically, not every frame ---
+                #         current_time = time.time()
+                #         if current_time - last_print_time > 1.0: # Print once per second
+                #             print(f"LKA ACTIVE: Frame #{frame_process_count}. "
+                #                 f"Correction calculated: {lka_steering_correction_norm:.4f}")
+                #             last_print_time = current_time
+                #     else:
+                #         # This will tell us if LKA is enabled but no frames are arriving.
+                #         current_time = time.time()
+                #         if current_time - last_print_time > 1.0:
+                #             print("LKA WARNING: LKA is ENABLED, but no camera frame has been received yet.")
+                #             last_print_time = current_time
+
+
 
                 raw_vehicle_state = np.array(vehicle_data_from_main['state'])
                 self.vehicle_state_history.append(raw_vehicle_state)
@@ -538,6 +807,7 @@ class MPCProcess(multiprocessing.Process):
                 max_physical_steer_angle_rad = vehicle_data_from_main.get('max_steer_rad', np.radians(70.0))
                 haptic_collision_intensity = vehicle_data_from_main.get('collision_intensity', 0.0)
                 haptic_accel_magnitude = vehicle_data_from_main.get('accel_magnitude', 0.0)
+                
 
                 with self._phone_data_lock:
                     processed_ay = self._calculate_wma(self.ay_history, default_value=self.ay_data_phone)
@@ -596,10 +866,25 @@ class MPCProcess(multiprocessing.Process):
                     throttle_cmd = 1.0 if accel_button_pressed == 1 else 0.0
                     brake_cmd = 1.0 if brake_button_pressed == 1 else 0.0
                     if brake_cmd > 0.0: throttle_cmd = 0.0 # Prioritize braking
+
+                # --- Combine User Input and LKA Correction ---
+                # Convert LKA's normalized correction to a radian angle
+                # Note: max_physical_steer_angle_rad is received from Android_control
+                lka_steering_correction_rad = lka_steering_correction_norm * max_physical_steer_angle_rad
                 
+                # Blend the inputs
+                final_desired_steer_angle_rad = (1 - lka_strength) * desired_steer_angle_rad + \
+                                                (lka_strength) * lka_steering_correction_rad
+                
+                # Ensure the blended angle is still within physical limits
+                final_desired_steer_angle_rad = np.clip(final_desired_steer_angle_rad, -max_physical_steer_angle_rad, max_physical_steer_angle_rad)
+
+                # Now, feed this combined angle into the MPC
                 optimal_target_steer_angle_rad = self.mpc_controller.compute_steering_command(
-                    processed_vehicle_state, desired_steer_angle_rad, desired_steer_rate_rps   
-                )
+                    processed_vehicle_state, 
+                    final_desired_steer_angle_rad, # Use the blended angle
+                    desired_steer_rate_rps   
+            )
 
                 normalized_steer_cmd = 0.0
                 if abs(max_physical_steer_angle_rad) > 1e-4: # Avoid division by zero
@@ -704,8 +989,13 @@ class MPCProcess(multiprocessing.Process):
         print("MPC_Process: stop() called.")
         self.running = False # Signal main loop to stop
         self._listener_running_flag.clear() # Signal phone listener thread to stop
+        self._camera_listener_running_flag.clear()
+
         if self.phone_listener.is_alive():
             self.phone_listener.join(timeout=1.0) # Wait for phone listener
+
+        if self.camera_listener.is_alive():
+            self.camera_listener.join(timeout=1.0) # Wait for camera listener
         
         # Close server socket for vehicle data
         if self.vehicle_data_conn:

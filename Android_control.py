@@ -33,6 +33,7 @@ import multiprocessing
 import json
 import queue
 from mpc_controller import MPCProcess
+import cv2
 
 
 try:
@@ -40,7 +41,7 @@ try:
     # ... (Keep all necessary pygame imports) ...
     from pygame.locals import KMOD_CTRL, KMOD_SHIFT, K_ESCAPE, K_q, K_SPACE # etc.
     # Ensure all required K_ constants are imported
-    from pygame.locals import K_0, K_9, K_BACKQUOTE, K_BACKSPACE, K_COMMA, K_DOWN, K_F1, K_LEFT, K_PERIOD, K_RIGHT, K_SLASH, K_TAB, K_UP, K_a, K_b, K_c, K_d, K_f, K_g, K_h, K_i, K_l, K_m, K_n, K_o, K_p, K_r, K_s, K_t, K_v, K_w, K_x, K_z, K_MINUS, K_EQUALS
+    from pygame.locals import K_0,K_k, K_9, K_BACKQUOTE, K_BACKSPACE, K_COMMA, K_DOWN, K_F1, K_LEFT, K_PERIOD, K_RIGHT, K_SLASH, K_TAB, K_UP, K_a, K_b, K_c, K_d, K_f, K_g, K_h, K_i, K_l, K_m, K_n, K_o, K_p, K_r, K_s, K_t, K_v, K_w, K_x, K_z, K_MINUS, K_EQUALS
 
 except ImportError:
     raise RuntimeError('cannot import pygame, make sure pygame package is installed')
@@ -120,6 +121,7 @@ class World(object):
         self.imu_sensor = None # Keep IMU for HUD display if desired (accel data)
         self.radar_sensor = None
         self.camera_manager = None
+        self.lka_camera_manager = None
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
         self._actor_filter = args.filter
@@ -142,7 +144,8 @@ class World(object):
 
     def restart(self): # Removed args from here, should be passed during init
         args = self._actor_filter # Assuming this was the intent or pass args properly
-        self.player_max_speed = 1.589; self.player_max_speed_fast = 3.713
+        self.player_max_speed = 1.589 
+        self.player_max_speed_fast = 3.713
         cam_index = self.camera_manager.index if self.camera_manager is not None else 0
         cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
         
@@ -181,6 +184,10 @@ class World(object):
         self.camera_manager = CameraManager(self.player, self.hud, self._gamma)
         self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.set_sensor(cam_index, notify=False)
+        self.lka_camera_manager = CameraManager(self.player, self.hud, self._gamma)
+        self.lka_camera_manager.transform_index = 1
+        self.lka_camera_manager.set_sensor(cam_index, notify=False)
+
         self.hud.notification(get_actor_display_name(self.player))
         if self.traffic_manager: # Check if traffic_manager is available
              self.traffic_manager.update_vehicle_lights(self.player, True)
@@ -268,7 +275,8 @@ class World(object):
 class SensorControl(object):
     def __init__(self, world, start_in_autopilot,
                  mpc_vehicle_data_address=('127.0.0.1', 6003),
-                 control_cmd_server_address=('127.0.0.1', 6004)):
+                 control_cmd_server_address=('127.0.0.1', 6004),
+                 mpc_image_data_address=('127.0.0.1', 6005)):
         self._world_ref = weakref.ref(world)
         self._autopilot_enabled = start_in_autopilot
         self._control = carla.VehicleControl() 
@@ -277,9 +285,13 @@ class SensorControl(object):
         # IPC Sockets Configuration
         self.mpc_vehicle_data_address = mpc_vehicle_data_address
         self.control_cmd_server_address = control_cmd_server_address
+        self.mpc_image_data_address = mpc_image_data_address
         
         # Socket for sending vehicle data to MPC (client)
         self.vehicle_data_socket_client = None
+
+        # Socket for sending image data to MPC (client)
+        self.image_data_socket_client = None
         
         # Server socket for receiving control commands from MPC
         self.control_cmd_socket_server = None
@@ -317,6 +329,61 @@ class SensorControl(object):
             else: self._control = None # Not a vehicle
             if world_instance.hud: world_instance.hud.notification("Sensor Control (IPC via Sockets). Press 'H'.", seconds=4.0)
         else: self._control = None; print("Error: SensorControl initialized with invalid world or player.")
+    
+    def _connect_image_data_client(self):
+        """ Establishes a client socket connection to MPCProcess for sending image data. """
+        try:
+            if self.image_data_socket_client: self.image_data_socket_client.close()
+            self.image_data_socket_client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.image_data_socket_client.settimeout(2.0) 
+            self.image_data_socket_client.connect(self.mpc_image_data_address)
+            print(f"Android_control: Connected to MPC image data server at {self.mpc_image_data_address}")
+            return True
+        except Exception as e:
+            # This can be noisy, so we comment it out for now.
+            # print(f"Android_control: Failed to connect to MPC image data server: {e}")
+            if self.image_data_cocket_client: self.image_data_socket_client.close()
+            self.image_data_socket_client = None
+            return False
+    
+    def _send_image_data(self, image_array):
+        if image_array is None:
+            return False
+        
+        if not self.image_data_socket_client:
+            if not self._connect_image_data_client():
+                return False # Cannot send if not connected
+            
+        
+        try:
+            # Encode the image as JPEG. This is MUCH smaller than raw data.
+            # Quality can be tuned (0-100). 75 is a good balance.
+            result, encoded_image_np = cv2.imencode('.jpg', image_array, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+            if not result:
+                print("Android_control: Failed to encode image to JPEG.")
+                return False
+            
+            encoded_image_bytes = encoded_image_np.tobytes()
+
+            # Pack the size of the encoded image into a 4-byte header
+            data_size = len(encoded_image_bytes).to_bytes(4, 'big')
+
+            # Send the header followed by the image data
+            self.image_data_socket_client.sendall(data_size + encoded_image_bytes)
+            return True
+        except (socket.error, BrokenPipeError) as e:
+            print(f"Android_control: Error sending image data: {e}. Closing connection.")
+            if self.image_data_socket_client: self.image_data_socket_client.close()
+            self.image_data_socket_client = None
+            return False
+        except Exception as e:
+            print(f"Android_control: Unexpected error sending image data: {e}")
+            traceback.print_exc()
+            if self.image_data_socket_client: self.image_data_socket_client.close()
+            self.image_data_socket_client = None
+            return False
+
+
 
     def _connect_vehicle_data_client_with_retries(self, max_retries=3, delay=1):
         """Tries to connect the vehicle data client socket with retries."""
@@ -472,7 +539,8 @@ class SensorControl(object):
         world_instance = self._get_world()
         if not world_instance or not world_instance.player or not world_instance.player.is_alive:
             for event in pygame.event.get():
-                if event.type == pygame.QUIT or (event.type == pygame.KEYUP and self._is_quit_shortcut(event.key)): return True
+                if event.type == pygame.QUIT or (event.type == pygame.KEYUP and self._is_quit_shortcut(event.key)): 
+                    return True
             return False
 
         player = world_instance.player
@@ -493,39 +561,26 @@ class SensorControl(object):
         accel_vec = player.get_acceleration(); accel_mag = np.sqrt(accel_vec.x**2 + accel_vec.y**2 + accel_vec.z**2)
 
         data_to_mpc = {'state': current_vehicle_state_list, 'max_steer_rad': max_physical_steer_angle_rad,
-                       'collision_intensity': collision_intensity, 'accel_magnitude': accel_mag }
+                       'collision_intensity': collision_intensity, 'accel_magnitude': accel_mag,'lka_toggle_request': False}
         
-        # --- Put vehicle data into the send queue (non-blocking) ---
-        try:
-            self.vehicle_data_send_queue.put_nowait(data_to_mpc)
-        except queue.Full:
-            # print("Android_control: Vehicle data send queue to MPC is full. Frame data might be dropped.")
-            pass 
+        
 
-        # --- Check if MPC control is stale (as before) ---
-        with self._data_lock:
-            time_since_last_mpc_update = time.time() - self._last_mpc_control_update_time
-            # Make a copy of the control to apply, to avoid holding lock during apply_control
-            control_to_apply_this_frame = carla.VehicleControl()
-            control_to_apply_this_frame.steer = self._control.steer
-            control_to_apply_this_frame.throttle = self._control.throttle
-            control_to_apply_this_frame.brake = self._control.brake
-            control_to_apply_this_frame.reverse = self._control.reverse
-            control_to_apply_this_frame.manual_gear_shift = self._control.manual_gear_shift
-            control_to_apply_this_frame.gear = self._control.gear
-            
-            if time_since_last_mpc_update > 1.5: 
-                # print(f"Android_control: MPC control data stale ({time_since_last_mpc_update:.2f}s). Applying emergency brake.")
-                control_to_apply_this_frame.steer = 0.0
-                control_to_apply_this_frame.throttle = 0.0
-                control_to_apply_this_frame.brake = 0.8 
-
+        # --- NEW: Get and send the camera image ---
+        if world_instance and world_instance.lka_camera_manager:
+            # Get the latest image array from the camera manager
+            image_to_send = world_instance.lka_camera_manager.raw_image_array
+            if image_to_send is not None:
+                self._send_image_data(image_to_send)
         # --- Process Keyboard Events for Auxiliary Actions (Unchanged from previous version) ---
         current_lights = self._lights
         for event in pygame.event.get():
             if event.type == pygame.QUIT: return True
             elif event.type == pygame.KEYUP:
-                if self._is_quit_shortcut(event.key): return True
+                if self._is_quit_shortcut(event.key): 
+                    return True
+                elif event.key == K_k: 
+                    print("Android_control: Sending LKA toggle request.")
+                    data_to_mpc['lka_toggle_request'] = True
                 elif event.key == K_BACKSPACE:
                     if self._autopilot_enabled:
                         if player: player.set_autopilot(False)
@@ -577,6 +632,33 @@ class SensorControl(object):
                     elif event.key == K_i: current_lights ^= carla.VehicleLightState.Interior
                     elif event.key == K_z: current_lights ^= carla.VehicleLightState.LeftBlinker
                     elif event.key == K_x: current_lights ^= carla.VehicleLightState.RightBlinker
+
+        # --- Put vehicle data into the send queue (non-blocking) ---
+        try:
+            self.vehicle_data_send_queue.put_nowait(data_to_mpc)
+        except queue.Full:
+            # print("Android_control: Vehicle data send queue to MPC is full. Frame data might be dropped.")
+            pass 
+        
+
+        # --- Check if MPC control is stale (as before) ---
+        with self._data_lock:
+            time_since_last_mpc_update = time.time() - self._last_mpc_control_update_time
+            # Make a copy of the control to apply, to avoid holding lock during apply_control
+            control_to_apply_this_frame = carla.VehicleControl()
+            control_to_apply_this_frame.steer = self._control.steer
+            control_to_apply_this_frame.throttle = self._control.throttle
+            control_to_apply_this_frame.brake = self._control.brake
+            control_to_apply_this_frame.reverse = self._control.reverse
+            control_to_apply_this_frame.manual_gear_shift = self._control.manual_gear_shift
+            control_to_apply_this_frame.gear = self._control.gear
+            
+            if time_since_last_mpc_update > 1.5: 
+                # print(f"Android_control: MPC control data stale ({time_since_last_mpc_update:.2f}s). Applying emergency brake.")
+                control_to_apply_this_frame.steer = 0.0
+                control_to_apply_this_frame.throttle = 0.0
+                control_to_apply_this_frame.brake = 0.8 
+
         
         # --- Apply Control if not in Autopilot ---
         if not self._autopilot_enabled and player and player.is_alive:
@@ -918,14 +1000,18 @@ class RadarSensor(object):
             self.debug.draw_point(radar_data.transform.location + fw_vec, size=0.075, life_time=0.06, persistent_lines=False, color=carla.Color(r, g, b))
 
 class CameraManager(object):
-    # ... (Keep class implementation as is) ...
     def __init__(self, parent_actor, hud, gamma_correction):
-        self.sensor = None; self.surface = None; self._parent = parent_actor; self.hud = hud; self.recording = False
+        self.sensor = None
+        self.surface = None
+        self._parent = parent_actor
+        self.hud = hud
+        self.recording = False
+        self.raw_image_array = None
         bound_x = 0.5 + self._parent.bounding_box.extent.x; bound_y = 0.5 + self._parent.bounding_box.extent.y; bound_z = 0.5 + self._parent.bounding_box.extent.z
         Attachment = carla.AttachmentType
         if not self._parent.type_id.startswith("walker.pedestrian"):
              self._camera_transforms = [
-                (carla.Transform(carla.Location(x=-2.0*bound_x, y=+0.0*bound_y, z=2.0*bound_z), carla.Rotation(pitch=8.0)), Attachment.SpringArmGhost),
+                (carla.Transform(carla.Location(x=+0.01*bound_x, y=-0.25*bound_y, z=0.9*bound_z)), Attachment.Rigid),
                 (carla.Transform(carla.Location(x=+0.8*bound_x, y=+0.0*bound_y, z=1.3*bound_z)), Attachment.Rigid),
                 (carla.Transform(carla.Location(x=+1.9*bound_x, y=+1.0*bound_y, z=1.2*bound_z)), Attachment.SpringArmGhost),
                 (carla.Transform(carla.Location(x=-2.8*bound_x, y=+0.0*bound_y, z=4.6*bound_z), carla.Rotation(pitch=6.0)), Attachment.SpringArmGhost),
@@ -979,7 +1065,7 @@ class CameraManager(object):
         if self.surface is not None: display.blit(self.surface, (0, 0))
     @staticmethod
     def _parse_image(weak_self, image):
-        self = weak_self();
+        self = weak_self()
         if not self: return
         # Lidar and Camera parsing logic remains the same
         if self.sensors[self.index][0] == 'sensor.lidar.ray_cast':
@@ -1004,6 +1090,9 @@ class CameraManager(object):
             array = np.reshape(array, (image.height, image.width, 4)); array = array[:, :, :3]; array = array[:, :, ::-1]
             self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
         if self.recording: image.save_to_disk('_out/%08d' % image.frame)
+        self.raw_image_array = array
+
+
 
 FIXED_SIMULATION_STEP_TIME = 0.017
 # ==============================================================================
@@ -1075,20 +1164,31 @@ def game_loop(args):
         
         vehicle_data_server_addr = (args.ipc_host, args.ipc_vehicle_data_port)
         control_cmd_client_addr = (args.ipc_host, args.ipc_control_cmd_port)
+        image_data_server_addr = (args.ipc_host, args.ipc_image_data_port)
+
+        # --- FIX: Instantiate the SERVER FIRST ---
+        # SensorControl now uses socket addresses
+        print("Game_loop: Initializing SensorControl (Server)...")
+        controller = SensorControl(world, args.autopilot,
+                                   mpc_vehicle_data_address=vehicle_data_server_addr,
+                                   control_cmd_server_address=control_cmd_client_addr,
+                                   mpc_image_data_address=image_data_server_addr) # Make sure you added this arg
+        # The SensorControl __init__ method will start its listening threads.
+        # We can add a small, optional delay to be safe.
+        time.sleep(0.5) 
 
         mpc_process_instance = MPCProcess(
             mpc_params, phone_tcp_config, control_config,
             vehicle_data_server_address=vehicle_data_server_addr,
-            control_cmd_client_address=control_cmd_client_addr
-        )
+            control_cmd_client_address=control_cmd_client_addr,
+            image_data_server_address=image_data_server_addr # Pass new address
+            )
         mpc_process_instance.start()
         print("Game_loop: MPC Process started.")
 
         # SensorControl now uses socket addresses
-        controller = SensorControl(world, args.autopilot,
-                                   mpc_vehicle_data_address=vehicle_data_server_addr,
-                                   control_cmd_server_address=control_cmd_client_addr)
-
+        
+        
         if args.sync: sim_world.tick()
         else: sim_world.wait_for_tick()
 
@@ -1160,6 +1260,7 @@ def main():
     argparser.add_argument('--ipc_host', default='127.0.0.1', help='Host for IPC sockets between Android_control and MPC (default: 127.0.0.1)')
     argparser.add_argument('--ipc_vehicle_data_port', default=6003, type=int, help='Port for Android_control to send vehicle data to MPC (default: 6003)')
     argparser.add_argument('--ipc_control_cmd_port', default=6004, type=int, help='Port for MPC to send control commands to Android_control (default: 6004)')
+    argparser.add_argument('--ipc_image_data_port', default=6005, type=int, help='Port for Android_control to send camera images to MPC (default: 6005)')
 
     # Args for control_config (passed to MPCProcess)
     argparser.add_argument('--steer_angle_sensitivity', default=0.7, type=float, help='Sensitivity for AY to desired steer angle.')
