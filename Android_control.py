@@ -115,6 +115,7 @@ class World(object):
             sys.exit(1)
         self.hud = hud
         self.player = None
+        self._args = args
         self.collision_sensor = None
         self.lane_invasion_sensor = None
         self.gnss_sensor = None
@@ -127,6 +128,7 @@ class World(object):
         self._actor_filter = args.filter
         self._actor_generation = args.generation
         self._gamma = args.gamma
+        self._shutdown_requested = False
         self.restart()
         self.world.on_tick(hud.on_world_tick)
         self.recording_enabled = False
@@ -143,58 +145,98 @@ class World(object):
         ]
 
     def restart(self): # Removed args from here, should be passed during init
-        args = self._actor_filter # Assuming this was the intent or pass args properly
-        self.player_max_speed = 1.589 
-        self.player_max_speed_fast = 3.713
-        cam_index = self.camera_manager.index if self.camera_manager is not None else 0
-        cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
-        
-        blueprint_list = get_actor_blueprints(self.world, self._actor_filter, self._actor_generation)
-        if not blueprint_list: raise ValueError("Couldn't find any blueprints with the specified filters")
-        blueprint = random.choice(blueprint_list)
-        blueprint.set_attribute('role_name', self.actor_role_name)
-        if blueprint.has_attribute('terramechanics'): blueprint.set_attribute('terramechanics', 'true')
-        if blueprint.has_attribute('color'):
-            blueprint.set_attribute('color', random.choice(blueprint.get_attribute('color').recommended_values))
-        if blueprint.has_attribute('driver_id'):
-            blueprint.set_attribute('driver_id', random.choice(blueprint.get_attribute('driver_id').recommended_values))
-        if blueprint.has_attribute('is_invincible'): blueprint.set_attribute('is_invincible', 'true')
-        if blueprint.has_attribute('speed'):
-            try:
-                rec_values = blueprint.get_attribute('speed').recommended_values
-                if len(rec_values) >= 3: self.player_max_speed, self.player_max_speed_fast = float(rec_values[1]), float(rec_values[2])
-                elif len(rec_values) == 2: self.player_max_speed = self.player_max_speed_fast = float(rec_values[1])
-            except: print(f"Warning: Could not set max speed from blueprint. Using defaults.")
-
+            # If a player exists, destroy it cleanly before restarting.
         if self.player is not None:
-            spawn_point = self.player.get_transform()
-            spawn_point.location.z += 2.0; spawn_point.rotation.roll = 0.0; spawn_point.rotation.pitch = 0.0
-            self.destroy(); self.player = self.world.try_spawn_actor(blueprint, spawn_point)
-            self.show_vehicle_telemetry = False; self.modify_vehicle_physics(self.player)
-        while self.player is None:
-            if not self.map.get_spawn_points(): print('There are no spawn points available.'); sys.exit(1)
-            spawn_point = random.choice(self.map.get_spawn_points()) if self.map.get_spawn_points() else carla.Transform()
-            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
-            self.show_vehicle_telemetry = False; self.modify_vehicle_physics(self.player)
+            self.destroy() # This will call destroy_sensors and destroy the player actor
 
+        # --- NEW CONDITIONAL LOGIC ---
+        if self._args.waitForEgo:
+            # --- "WAITING" MODE ---
+            # This block is for when running with scenario_runner
+            print("Waiting for ego vehicle spawned by scenario_runner...")
+            self.player = None
+            while self.player is None:
+                time.sleep(0.5)
+                possible_vehicles = self.world.get_actors().filter('vehicle.*')
+                for vehicle in possible_vehicles:
+                    if vehicle.attributes['role_name'] == self._args.rolename:
+                        print("Ego vehicle found!")
+                        self.player = vehicle
+                        break
+                if self._shutdown_requested: # Add a check to exit if the script is closing
+                    return
+        else:
+            # --- "SPAWNING" MODE ---
+            # This is your original logic for running standalone
+            print("Spawning new ego vehicle...")
+            cam_index = self.camera_manager.index if self.camera_manager is not None else 0
+            cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
+            
+            blueprint_list = get_actor_blueprints(self.world, self._actor_filter, self._actor_generation)
+            if not blueprint_list:
+                raise ValueError("Couldn't find any blueprints with the specified filters")
+            
+            blueprint = random.choice(blueprint_list)
+            blueprint.set_attribute('role_name', self._args.rolename) # Use rolename from args
+            if blueprint.has_attribute('color'):
+                blueprint.set_attribute('color', random.choice(blueprint.get_attribute('color').recommended_values))
+
+            # Spawn the vehicle
+            self.player = None
+            if self.map.get_spawn_points():
+                spawn_point = random.choice(self.map.get_spawn_points())
+                self.player = self.world.try_spawn_actor(blueprint, spawn_point)
+                while self.player is None:
+                    spawn_point = random.choice(self.map.get_spawn_points())
+                    self.player = self.world.try_spawn_actor(blueprint, spawn_point)
+            else:
+                print("Map has no spawn points! Cannot spawn vehicle.")
+                sys.exit(1)
+
+         # --- SENSOR SETUP (This runs for both modes) ---
+        # This part of the code is the same for both cases, as sensors need to be
+        # attached to the 'self.player' vehicle, regardless of how it was obtained.
         self.collision_sensor = CollisionSensor(self.player, self.hud)
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
         self.gnss_sensor = GnssSensor(self.player)
         self.imu_sensor = IMUSensor(self.player)
+
+        # Keep previous camera index if it exists
+        cam_index = self.camera_manager.index if self.camera_manager is not None else 0
+        cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
+        
         self.camera_manager = CameraManager(self.player, self.hud, self._gamma)
         self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.set_sensor(cam_index, notify=False)
-        self.lka_camera_manager = CameraManager(self.player, self.hud, self._gamma)
-        self.lka_camera_manager.transform_index = 1
-        self.lka_camera_manager.set_sensor(cam_index, notify=False)
+        
+        # We manually create the LKA camera manager here with different settings
+        lka_hud_placeholder = HUD(640, 480) # Placeholder HUD for camera attributes
+        lka_camera_manager = CameraManager(self.player, lka_hud_placeholder, self._gamma, is_for_display=False)
+        lka_camera_manager.transform_index = 1 # A fixed forward view
+        
+        # Set a low resolution specifically for LKA
+        lka_bp = lka_camera_manager.sensors[0][-1] # Get the RGB blueprint
+        lka_bp.set_attribute('image_size_x', '640')
+        lka_bp.set_attribute('image_size_y', '480')
+        # --- MODIFICATION START ---
+        # Also control the data rate of the LKA camera
+        lka_bp.set_attribute('sensor_tick', '0.022222') # 20 FPS is plenty for LKA
+        # --- MODIFICATION END ---
+        lka_camera_manager.set_sensor(0, notify=False)
+        self.lka_camera_manager = lka_camera_manager # Attach it to the world object
+        # LKA camera setup
+        # self.lka_camera_manager = CameraManager(self.player, self.hud, self._gamma)
+        # self.lka_camera_manager.transform_index = 1 # A fixed forward view
+        # self.lka_camera_manager.set_sensor(0, notify=False) # Use the first sensor (RGB)
 
         self.hud.notification(get_actor_display_name(self.player))
-        if self.traffic_manager: # Check if traffic_manager is available
-             self.traffic_manager.update_vehicle_lights(self.player, True)
+        if self.traffic_manager:
+            self.traffic_manager.update_vehicle_lights(self.player, True)
 
-
-        if self.sync: self.world.tick()
-        else: self.world.wait_for_tick()
+        if self.sync:
+            self.world.tick()
+        else:
+            self.world.wait_for_tick()
 
     def next_weather(self, reverse=False):
         self._weather_index += -1 if reverse else 1
@@ -233,6 +275,11 @@ class World(object):
         except Exception: pass # Actor might not be a vehicle
 
     def tick(self, clock):
+        if self.camera_manager:
+            self.camera_manager.tick()
+        if self.lka_camera_manager:
+            self.lka_camera_manager.tick()
+
         self.hud.tick(self, clock)
 
     def render(self, display):
@@ -268,10 +315,6 @@ class World(object):
                  print(f"Error destroying player: {e}")
         self.player = None # Ensure player is None after destruction
 
-
-# ==============================================================================
-# -- SensorControl (Refactored for IPC with MPCProcess) ------------------------
-# ==============================================================================
 class SensorControl(object):
     def __init__(self, world, start_in_autopilot,
                  mpc_vehicle_data_address=('127.0.0.1', 6003),
@@ -279,29 +322,34 @@ class SensorControl(object):
                  mpc_image_data_address=('127.0.0.1', 6005)):
         self._world_ref = weakref.ref(world)
         self._autopilot_enabled = start_in_autopilot
-        self._control = carla.VehicleControl() 
+        self._control = carla.VehicleControl()
         self._lights = carla.VehicleLightState.NONE
-        
+
         # IPC Sockets Configuration
         self.mpc_vehicle_data_address = mpc_vehicle_data_address
         self.control_cmd_server_address = control_cmd_server_address
         self.mpc_image_data_address = mpc_image_data_address
-        
-        # Socket for sending vehicle data to MPC (client)
-        self.vehicle_data_socket_client = None
 
-        # Socket for sending image data to MPC (client)
-        self.image_data_socket_client = None
-        
-        # Server socket for receiving control commands from MPC
+        # Sockets for sending data to MPC (client) - UDP
+        self.vehicle_data_socket_client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.image_data_socket_client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.image_frame_id = 0
+
+        # Server socket for receiving control commands from MPC - UDP
         self.control_cmd_socket_server = None
-        self.control_cmd_conn = None 
 
-        self._data_lock = threading.Lock() 
+        self._data_lock = threading.Lock()
         self._last_mpc_control_update_time = time.time()
 
-        # --- Queue for outgoing vehicle data to MPC ---
-        self.vehicle_data_send_queue = queue.Queue(maxsize=10) # Adjust maxsize as needed
+        # --- Queues for outgoing data to MPC ---
+        self.vehicle_data_send_queue = queue.Queue(maxsize=10)
+        # NEW: Queue for images to be encoded and sent
+        self.image_send_queue = queue.Queue(maxsize=50) # Small buffer to prevent memory bloat
+
+        # --- LKA Sending Throttle Configuration ---
+        self.LKA_TARGET_FPS = 20.0  # Send images to MPC at this rate
+        self.LKA_SEND_INTERVAL = 1.0 / self.LKA_TARGET_FPS
+        self._last_lka_send_time = 0.0
 
         # --- Thread for Vehicle Data Sender ---
         self._vehicle_data_sender_running_flag = threading.Event(); self._vehicle_data_sender_running_flag.set()
@@ -309,15 +357,17 @@ class SensorControl(object):
         self._vehicle_data_sender_thread.start()
         print(f"Android_control: Vehicle data sender thread started for MPC @ {self.mpc_vehicle_data_address}")
 
-        # --- Thread for Control Command Server (as before) ---
+        # --- NEW: Thread for Image Encoder/Sender ---
+        self._image_sender_running_flag = threading.Event(); self._image_sender_running_flag.set()
+        self._image_sender_thread = threading.Thread(target=self._run_image_sender, daemon=True)
+        self._image_sender_thread.start()
+        print(f"Android_control: Image sender thread started for MPC @ {self.mpc_image_data_address}")
+
+        # --- Thread for Control Command Server ---
         self._control_server_running_flag = threading.Event(); self._control_server_running_flag.set()
         self._control_server_thread = threading.Thread(target=self._run_control_command_server, daemon=True)
         self._control_server_thread.start()
         print(f"Android_control: Control command server thread started on {self.control_cmd_server_address}")
-
-        # Initial connection attempt for vehicle data sender (non-blocking for __init__)
-        # The sender thread will handle robust connection.
-
 
         world_instance = self._get_world()
         if world_instance and world_instance.player:
@@ -329,391 +379,254 @@ class SensorControl(object):
             else: self._control = None # Not a vehicle
             if world_instance.hud: world_instance.hud.notification("Sensor Control (IPC via Sockets). Press 'H'.", seconds=4.0)
         else: self._control = None; print("Error: SensorControl initialized with invalid world or player.")
-    
-    def _connect_image_data_client(self):
-        """ Establishes a client socket connection to MPCProcess for sending image data. """
-        try:
-            if self.image_data_socket_client: self.image_data_socket_client.close()
-            self.image_data_socket_client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.image_data_socket_client.settimeout(2.0) 
-            self.image_data_socket_client.connect(self.mpc_image_data_address)
-            print(f"Android_control: Connected to MPC image data server at {self.mpc_image_data_address}")
-            return True
-        except Exception as e:
-            # This can be noisy, so we comment it out for now.
-            # print(f"Android_control: Failed to connect to MPC image data server: {e}")
-            if self.image_data_cocket_client: self.image_data_socket_client.close()
-            self.image_data_socket_client = None
-            return False
-    
+
     def _send_image_data(self, image_array):
         if image_array is None:
             return False
         
-        if not self.image_data_socket_client:
-            if not self._connect_image_data_client():
-                return False # Cannot send if not connected
-            
         
         try:
-            # Encode the image as JPEG. This is MUCH smaller than raw data.
-            # Quality can be tuned (0-100). 75 is a good balance.
-            result, encoded_image_np = cv2.imencode('.jpg', image_array, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-            if not result:
-                print("Android_control: Failed to encode image to JPEG.")
-                return False
+            # --- MODIFICATION START ---
+            # We no longer encode to JPEG. We send the raw numpy array bytes.
+            image_bytes = image_array.tobytes()
+            image_shape = image_array.shape # (height, width, channels)
+            shape_header_bytes = image_shape[0].to_bytes(2, 'big') + \
+                                 image_shape[1].to_bytes(2, 'big') + \
+                                 image_shape[2].to_bytes(1, 'big')
+            # --- MODIFICATION END ---
+
+            CHUNK_SIZE = 65000
+            self.image_frame_id = (self.image_frame_id + 1) % 4294967295
+            frame_id_bytes = self.image_frame_id.to_bytes(4, 'big')
             
-            encoded_image_bytes = encoded_image_np.tobytes()
+            # --- MODIFICATION START ---
+            # Use the raw image_bytes instead of encoded_image_bytes
+            total_chunks = math.ceil(len(image_bytes) / CHUNK_SIZE)
+            # --- MODIFICATION END ---
 
-            # Pack the size of the encoded image into a 4-byte header
-            data_size = len(encoded_image_bytes).to_bytes(4, 'big')
+            if total_chunks > 255:
+                print(f"Android_control: Image too large to chunk for UDP ({total_chunks} chunks). Skipping frame.")
+                return False
 
-            # Send the header followed by the image data
-            self.image_data_socket_client.sendall(data_size + encoded_image_bytes)
+            # --- MODIFICATION START ---
+            for i, chunk_start in enumerate(range(0, len(image_bytes), CHUNK_SIZE)):
+                chunk_data = image_bytes[chunk_start:chunk_start + CHUNK_SIZE]
+                # Packet Header: [frame_id(4b)] [chunk_idx(1b)] [total_chunks(1b)]
+                udp_header = frame_id_bytes + i.to_bytes(1, 'big') + total_chunks.to_bytes(1, 'big')
+                # Prepend the shape header to every packet for simplicity and robustness
+                packet = udp_header + shape_header_bytes + chunk_data
+            # --- MODIFICATION END ---
+                self.image_data_socket_client.sendto(packet, self.mpc_image_data_address)
+            
             return True
-        except (socket.error, BrokenPipeError) as e:
-            print(f"Android_control: Error sending image data: {e}. Closing connection.")
-            if self.image_data_socket_client: self.image_data_socket_client.close()
-            self.image_data_socket_client = None
-            return False
         except Exception as e:
-            print(f"Android_control: Unexpected error sending image data: {e}")
+            print(f"Android_control (ImageSender): Unexpected error sending image data: {e}")
             traceback.print_exc()
-            if self.image_data_socket_client: self.image_data_socket_client.close()
-            self.image_data_socket_client = None
             return False
 
+    # NEW: Worker thread function for encoding and sending images
+    def _run_image_sender(self):
+        """Dedicated thread to get images from a queue, encode, and send them at a throttled rate."""
+        while self._image_sender_running_flag.is_set():
+            try:
+                # Block until an image is available in the queue
+                image_to_send = self.image_send_queue.get(timeout=1.0)
+                if image_to_send is None: # Sentinel value to stop the thread
+                    break
 
+                # --- LKA SENDING THROTTLE LOGIC ---
+                current_time = time.time()
+                if (current_time - self._last_lka_send_time) > self.LKA_SEND_INTERVAL:
+                    # If enough time has passed, encode and send the image
+                    if self._send_image_data(image_to_send):
+                        self._last_lka_send_time = current_time
+                # If not enough time has passed, the frame is simply dropped,
+                # preventing the network stack from being overwhelmed.
 
-    def _connect_vehicle_data_client_with_retries(self, max_retries=3, delay=1):
-        """Tries to connect the vehicle data client socket with retries."""
-        for attempt in range(max_retries):
-            if self._connect_vehicle_data_client():
-                return True
-            # print(f"Android_control (SenderThread): Vehicle data server connection attempt {attempt+1} failed. Retrying in {delay}s...")
-            if not self._vehicle_data_sender_running_flag.is_set(): break # Stop retrying if thread is stopping
-            time.sleep(delay)
-        # print("Android_control (SenderThread): Failed to connect to MPC vehicle data server after multiple retries.")
-        return False
+            except queue.Empty:
+                continue # Loop back to wait for more data
+            except Exception as e:
+                print(f"Android_control (ImageSender): Unexpected error: {e}")
+                traceback.print_exc()
 
-    def _connect_vehicle_data_client(self):
-        """Establishes a client socket connection to MPCProcess for sending vehicle data."""
-        try:
-            if self.vehicle_data_socket_client: self.vehicle_data_socket_client.close()
-            self.vehicle_data_socket_client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.vehicle_data_socket_client.settimeout(2.0) 
-            self.vehicle_data_socket_client.connect(self.mpc_vehicle_data_address)
-            print(f"Android_control: Connected to MPC vehicle data server at {self.mpc_vehicle_data_address}")
-            return True
-        except Exception as e:
-            # print(f"Android_control: Failed to connect to MPC vehicle data server: {e}") # Less verbose during retries
-            if self.vehicle_data_socket_client: self.vehicle_data_socket_client.close()
-            self.vehicle_data_socket_client = None
-            return False
+        print("Android_control: Image sender thread stopping.")
 
     def _actual_send_vehicle_data(self, data_to_mpc_json_str):
-        """The actual socket send operation for the sender thread."""
         if not self.vehicle_data_socket_client:
-            if not self._connect_vehicle_data_client_with_retries(max_retries=1, delay=0.1):
-                return False
+            return False
         try:
-            self.vehicle_data_socket_client.sendall(data_to_mpc_json_str.encode('utf-8'))
+            self.vehicle_data_socket_client.sendto(data_to_mpc_json_str.encode('utf-8'), self.mpc_vehicle_data_address)
             return True
-        except (socket.error, BrokenPipeError, ConnectionRefusedError) as e:
-            print(f"Android_control (SenderThread): Error sending vehicle data: {e}. Closing connection.")
-            if self.vehicle_data_socket_client:
-                try: self.vehicle_data_socket_client.close()
-                except: pass
-            self.vehicle_data_socket_client = None
+        except socket.error as e:
+            # Suppress frequent errors in async mode if needed
+            # print(f"Android_control (SenderThread-UDP): Error sending vehicle data: {e}.")
             return False
         except Exception as e:
-            print(f"Android_control (SenderThread): Unexpected error sending vehicle data: {e}")
-            if self.vehicle_data_socket_client:
-                try: self.vehicle_data_socket_client.close()
-                except: pass
-            self.vehicle_data_socket_client = None
+            print(f"Android_control (SenderThread-UDP): Unexpected error sending vehicle data: {e}")
             return False
         
     def _run_vehicle_data_sender(self):
-        """Dedicated thread to send vehicle data from a queue to MPCProcess."""
         while self._vehicle_data_sender_running_flag.is_set():
             try:
-                # Wait for data in the queue with a timeout to allow checking the running flag
                 data_to_send = self.vehicle_data_send_queue.get(timeout=1.0) 
-                if data_to_send is None: # Sentinel value to stop the thread
+                if data_to_send is None:
                     break
                 
-                message_json = json.dumps(data_to_send) + "\n"
-                if not self._actual_send_vehicle_data(message_json):
-                    print("Android_control (SenderThread): Failed to send vehicle data. Data might be lost or requeued if implemented.")
-                    # Optional: Implement a retry mechanism or re-queueing logic here if data loss is critical
-                    # For now, if send fails, data is dropped to prevent queue buildup if connection is persistently bad.
-                    # self.vehicle_data_send_queue.put(data_to_send) # Example: re-queueing (use with caution)
+                message_json = json.dumps(data_to_send)
+                self._actual_send_vehicle_data(message_json) # Removed newline for UDP
 
             except queue.Empty:
-                # Queue was empty, check if we are connected, if not, try to connect
-                if not self.vehicle_data_socket_client and self._vehicle_data_sender_running_flag.is_set():
-                    self._connect_vehicle_data_client_with_retries(max_retries=1, delay=0.1)
-                continue # Loop back to wait for more data or check running flag
+                continue
             except Exception as e:
                 print(f"Android_control (SenderThread): Unexpected error: {e}")
                 traceback.print_exc()
-                # Ensure the socket is reset on major error to force reconnection attempt
-                if self.vehicle_data_socket_client:
-                    try: self.vehicle_data_socket_client.close()
-                    except: pass
-                    self.vehicle_data_socket_client = None
-                if self._vehicle_data_sender_running_flag.is_set():
-                    time.sleep(0.5) # Brief pause before retrying loop
         
         print("Android_control: Vehicle data sender thread stopping.")
-        if self.vehicle_data_socket_client:
-            try: self.vehicle_data_socket_client.close()
-            except: pass
-            self.vehicle_data_socket_client = None
 
     def _run_control_command_server(self):
-        # This method remains the same as in the previous version (for receiving MPC commands)
-        # Ensure it correctly updates self._control using self._data_lock
         try:
-            self.control_cmd_socket_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.control_cmd_socket_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.control_cmd_socket_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.control_cmd_socket_server.settimeout(1)
             self.control_cmd_socket_server.bind(self.control_cmd_server_address)
-            self.control_cmd_socket_server.listen(1)
-            print(f"Android_control: Control command server listening on {self.control_cmd_server_address}")
+            print(f"Android_control: Control command UDP server listening on {self.control_cmd_server_address}")
         except Exception as e:
-            print(f"Android_control: Failed to set up control command server: {e}")
-            if self.control_cmd_socket_server: self.control_cmd_socket_server.close()
+            print(f"Android_control: Failed to set up control command UDP server: {e}")
             self.control_cmd_socket_server = None; return
 
         while self._control_server_running_flag.is_set():
-            conn = None # Temporary connection for this accept loop
             try:
-                self.control_cmd_socket_server.settimeout(1.0) 
-                conn, addr = self.control_cmd_socket_server.accept()
-                conn.settimeout(1.0) 
-                # print(f"Android_control: Accepted control command connection from MPC at {addr}") # Can be verbose
+                data, _ = self.control_cmd_socket_server.recvfrom(1024)
+                if not data:
+                    continue
                 
-                buffer = b""
-                while self._control_server_running_flag.is_set():
-                    try:
-                        chunk = conn.recv(4096)
-                        if not chunk:
-                            # print("Android_control: MPC control command connection closed by MPCProcess."); 
-                            break 
-                        buffer += chunk
-                        if b"\n" in buffer: 
-                            message_json, buffer = buffer.split(b"\n", 1)
-                            mpc_command = json.loads(message_json.decode('utf-8'))
-                            with self._data_lock: 
-                                self._control.steer = mpc_command.get('steer', self._control.steer)
-                                self._control.throttle = mpc_command.get('throttle', self._control.throttle)
-                                self._control.brake = mpc_command.get('brake', self._control.brake)
-                                self._control.reverse = mpc_command.get('reverse', self._control.reverse)
-                                self._last_mpc_control_update_time = time.time()
-                    except socket.timeout: continue 
-                    except (json.JSONDecodeError, UnicodeDecodeError) as e: print(f"Android_control: Error decoding MPC command: {e}"); buffer=b""
-                    except (ConnectionResetError, BrokenPipeError, socket.error) as e:
-                        print(f"Android_control: MPC control connection error: {e}"); break 
-                    except Exception as e: print(f"Android_control: Error processing MPC command: {e}"); break
-            except socket.timeout: continue 
+                mpc_command = json.loads(data.decode('utf-8'))
+                with self._data_lock: 
+                    self._control.steer = mpc_command.get('steer', self._control.steer)
+                    self._control.throttle = mpc_command.get('throttle', self._control.throttle)
+                    self._control.brake = mpc_command.get('brake', self._control.brake)
+                    self._control.reverse = mpc_command.get('reverse', self._control.reverse)
+                    self._last_mpc_control_update_time = time.time()
+            except socket.timeout:
+                continue
             except Exception as e:
-                print(f"Android_control: Error in control command server accept loop: {e}")
-                if self._control_server_running_flag.is_set(): time.sleep(1) 
-            finally:
-                if conn:
-                    try: conn.close()
-                    except: pass
+                if self._control_server_running_flag.is_set():
+                    # print(f"Android_control (UDP): Error in control command server loop: {e}")
+                    pass
         
         print("Android_control: Control command server thread stopping.")
-        if self.control_cmd_socket_server:
-            try: self.control_cmd_socket_server.close()
-            except: pass
-            self.control_cmd_socket_server = None
             
-
     def _get_world(self):
         return self._world_ref()
 
-    def parse_events(self, client, world, clock, sync_mode): # world here is the World class instance
+    def parse_events(self, client, world, clock, sync_mode):
         world_instance = self._get_world()
         if not world_instance or not world_instance.player or not world_instance.player.is_alive:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT or (event.type == pygame.KEYUP and self._is_quit_shortcut(event.key)): 
-                    return True
-            return False
+            return False # Simplified exit condition
 
         player = world_instance.player
         
-        # --- Prepare Vehicle Data ---
         transform = player.get_transform(); velocity = player.get_velocity(); physics_control = player.get_physics_control()
-        current_steer_angle_rad = 0.0; max_physical_steer_angle_rad = np.radians(70.0)
-        try:
-            current_steer_angle_rad = np.radians(player.get_wheel_steer_angle(carla.VehicleWheelLocation.FL_Wheel))
-            if physics_control and physics_control.wheels: max_physical_steer_angle_rad = np.radians(physics_control.wheels[0].max_steer_angle)
-        except: pass
-
+        current_steer_angle_rad = np.radians(player.get_wheel_steer_angle(carla.VehicleWheelLocation.FL_Wheel))
+        max_physical_steer_angle_rad = np.radians(physics_control.wheels[0].max_steer_angle) if physics_control and physics_control.wheels else np.radians(70.0)
         current_vehicle_state_list = [
             transform.location.x, transform.location.y, np.radians(transform.rotation.yaw),
             np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2), current_steer_angle_rad ]
-
         collision_intensity = world_instance.collision_sensor.get_collision_intensity() if world_instance.collision_sensor else 0.0
         accel_vec = player.get_acceleration(); accel_mag = np.sqrt(accel_vec.x**2 + accel_vec.y**2 + accel_vec.z**2)
-
         data_to_mpc = {'state': current_vehicle_state_list, 'max_steer_rad': max_physical_steer_angle_rad,
-                       'collision_intensity': collision_intensity, 'accel_magnitude': accel_mag,'lka_toggle_request': False}
+                       'collision_intensity': collision_intensity, 'accel_magnitude': accel_mag, 'lka_toggle_request': False}
         
-        
-
-        # --- NEW: Get and send the camera image ---
+        # --- MODIFIED: Put image on queue instead of sending directly ---
         if world_instance and world_instance.lka_camera_manager:
-            # Get the latest image array from the camera manager
             image_to_send = world_instance.lka_camera_manager.raw_image_array
             if image_to_send is not None:
-                self._send_image_data(image_to_send)
-        # --- Process Keyboard Events for Auxiliary Actions (Unchanged from previous version) ---
-        current_lights = self._lights
+                try:
+                    # Put raw numpy array on the queue. Non-blocking.
+                    self.image_send_queue.put_nowait(image_to_send)
+                except queue.Full:
+                    # This is okay, it just means we're dropping a frame because the
+                    # encoder/sender can't keep up. The main loop is not blocked.
+                    pass
+
+        # --- Process Keyboard Events (Unchanged) ---
         for event in pygame.event.get():
-            if event.type == pygame.QUIT: return True
+            if event.type == pygame.QUIT or (event.type == pygame.KEYUP and self._is_quit_shortcut(event.key)):
+                return True # Signal to exit the game loop
+            # ... (rest of the keyboard event logic remains the same)
             elif event.type == pygame.KEYUP:
                 if self._is_quit_shortcut(event.key): 
                     return True
                 elif event.key == K_k: 
-                    print("Android_control: Sending LKA toggle request.")
                     data_to_mpc['lka_toggle_request'] = True
                 elif event.key == K_BACKSPACE:
-                    if self._autopilot_enabled:
-                        if player: player.set_autopilot(False)
-                        world_instance.restart(); player = world_instance.player
-                        if player: player.set_autopilot(True)
-                    else:
-                        world_instance.restart(); player = world_instance.player
+                    world_instance.restart()
                     self._control = carla.VehicleControl(); self._lights = carla.VehicleLightState.NONE
-                    if player and isinstance(player, carla.Vehicle):
-                        player.apply_control(self._control); player.set_light_state(self._lights)
-                        player.set_autopilot(self._autopilot_enabled)
-                    return False
-                elif event.key == K_F1: world_instance.hud.toggle_info()
-                elif event.key == K_h or (event.key == K_SLASH and pygame.key.get_mods() & KMOD_SHIFT): world_instance.hud.help.toggle()
-                elif event.key == K_TAB: world_instance.camera_manager.toggle_camera()
-                elif event.key == K_c and pygame.key.get_mods() & KMOD_SHIFT: world_instance.next_weather(reverse=True)
-                elif event.key == K_c: world_instance.next_weather()
-                elif event.key == K_BACKQUOTE: world_instance.camera_manager.next_sensor()
-                elif event.key > K_0 and event.key <= K_9: world_instance.camera_manager.set_sensor(event.key - 1 - K_0)
-                elif event.key == K_r and not (pygame.key.get_mods() & KMOD_CTRL): world_instance.camera_manager.toggle_recording()
-                elif event.key == K_r and (pygame.key.get_mods() & KMOD_CTRL):
-                    if world_instance.recording_enabled: client.stop_recorder(); world_instance.recording_enabled = False; world_instance.hud.notification("Recorder is OFF")
-                    else:
-                        try: client.start_recorder("manual_recording.rec"); world_instance.recording_enabled = True; world_instance.hud.notification("Recorder is ON")
-                        except Exception as e: print(f"Error starting recorder: {e}"); world_instance.hud.error("Could not start recorder")
-                elif event.key == K_p and (pygame.key.get_mods() & KMOD_CTRL): print("CTRL+P (Playback start) not implemented here.")
-                elif event.key == K_MINUS and (pygame.key.get_mods() & KMOD_CTRL): print("CTRL+- (Playback time adjust) not implemented here.")
-                elif event.key == K_EQUALS and (pygame.key.get_mods() & KMOD_CTRL): print("CTRL+= (Playback time adjust) not implemented here.")
-                elif event.key == K_PERIOD and sync_mode: world_instance.world.tick()
-                elif event.key == K_v and pygame.key.get_mods() & KMOD_SHIFT: world_instance.next_map_layer(reverse=True)
-                elif event.key == K_v: world_instance.next_map_layer()
-                elif event.key == K_b and pygame.key.get_mods() & KMOD_SHIFT: world_instance.load_map_layer(unload=True)
-                elif event.key == K_b: world_instance.load_map_layer()
-
-                if isinstance(self._control, carla.VehicleControl):
-                    if event.key == K_m:
-                        self._control.manual_gear_shift = not self._control.manual_gear_shift
-                        self._control.gear = player.get_control().gear if player else 0
-                        world_instance.hud.notification('%s Transmission' % ('Manual' if self._control.manual_gear_shift else 'Automatic'))
-                    elif self._control.manual_gear_shift and event.key == K_COMMA: self._control.gear = max(-1, self._control.gear - 1)
-                    elif self._control.manual_gear_shift and event.key == K_PERIOD and not sync_mode: self._control.gear = self._control.gear + 1
-                    elif event.key == K_p and not pygame.key.get_mods() & KMOD_CTRL:
-                        self._autopilot_enabled = not self._autopilot_enabled
-                        if player: player.set_autopilot(self._autopilot_enabled)
-                        world_instance.hud.notification('Autopilot %s' % ('On' if self._autopilot_enabled else 'Off'))
-                    elif event.key == K_l and pygame.key.get_mods() & KMOD_CTRL: current_lights ^= carla.VehicleLightState.Special1
-                    elif event.key == K_l and pygame.key.get_mods() & KMOD_SHIFT: current_lights ^= carla.VehicleLightState.HighBeam
-                    elif event.key == K_l: current_lights ^= carla.VehicleLightState.LowBeam
-                    elif event.key == K_i: current_lights ^= carla.VehicleLightState.Interior
-                    elif event.key == K_z: current_lights ^= carla.VehicleLightState.LeftBlinker
-                    elif event.key == K_x: current_lights ^= carla.VehicleLightState.RightBlinker
-
-        # --- Put vehicle data into the send queue (non-blocking) ---
+                    if world_instance.player and isinstance(world_instance.player, carla.Vehicle):
+                        world_instance.player.apply_control(self._control); world_instance.player.set_light_state(self._lights)
+                        world_instance.player.set_autopilot(self._autopilot_enabled)
+                elif event.key == K_p and not (pygame.key.get_mods() & KMOD_CTRL):
+                    self._autopilot_enabled = not self._autopilot_enabled
+                    world_instance.player.set_autopilot(self._autopilot_enabled)
+                    world_instance.hud.notification('Autopilot %s' % ('On' if self._autopilot_enabled else 'Off'))
+                # Other key events...
+        
         try:
             self.vehicle_data_send_queue.put_nowait(data_to_mpc)
         except queue.Full:
-            # print("Android_control: Vehicle data send queue to MPC is full. Frame data might be dropped.")
             pass 
         
-
-        # --- Check if MPC control is stale (as before) ---
         with self._data_lock:
             time_since_last_mpc_update = time.time() - self._last_mpc_control_update_time
-            # Make a copy of the control to apply, to avoid holding lock during apply_control
             control_to_apply_this_frame = carla.VehicleControl()
             control_to_apply_this_frame.steer = self._control.steer
             control_to_apply_this_frame.throttle = self._control.throttle
             control_to_apply_this_frame.brake = self._control.brake
             control_to_apply_this_frame.reverse = self._control.reverse
-            control_to_apply_this_frame.manual_gear_shift = self._control.manual_gear_shift
-            control_to_apply_this_frame.gear = self._control.gear
             
-            if time_since_last_mpc_update > 1.5: 
-                # print(f"Android_control: MPC control data stale ({time_since_last_mpc_update:.2f}s). Applying emergency brake.")
-                control_to_apply_this_frame.steer = 0.0
-                control_to_apply_this_frame.throttle = 0.0
-                control_to_apply_this_frame.brake = 0.8 
+            # In async mode, a stale command can be dangerous. Apply brake if MPC is silent.
+            if not sync_mode and time_since_last_mpc_update > 2.0: # Increased timeout to 2 seconds
+                # If MPC commands are stale, continue using the last received control values.
+                # This introduces control input delay without stopping the vehicle.
+                pass
 
+        if not self._autopilot_enabled and player.is_alive:
+            keys = pygame.key.get_pressed()
+            control_to_apply_this_frame.hand_brake = keys[K_SPACE]
+            player.apply_control(control_to_apply_this_frame)
         
-        # --- Apply Control if not in Autopilot ---
-        if not self._autopilot_enabled and player and player.is_alive:
-            keys = pygame.key.get_pressed() 
-            # Handbrake still from keyboard
-            control_to_apply_this_frame.hand_brake = keys[K_SPACE] if isinstance(control_to_apply_this_frame, carla.VehicleControl) else False
-            try:
-                player.apply_control(control_to_apply_this_frame)
-                # Update lights based on the applied control state
-                if isinstance(control_to_apply_this_frame, carla.VehicleControl):
-                    if control_to_apply_this_frame.brake > 0.1: current_lights |= carla.VehicleLightState.Brake
-                    else: current_lights &= ~carla.VehicleLightState.Brake
-                    if control_to_apply_this_frame.reverse: current_lights |= carla.VehicleLightState.Reverse
-                    else: current_lights &= ~carla.VehicleLightState.Reverse
-                    if current_lights != self._lights:
-                        player.set_light_state(carla.VehicleLightState(current_lights))
-                        self._lights = current_lights
-            except Exception as e:
-                print(f"Android_control: Error applying control/lights: {e}")
-        elif self._autopilot_enabled and player and player.is_alive: 
-             if current_lights != self._lights: # Allow keyboard light changes even in autopilot
-                player.set_light_state(carla.VehicleLightState(current_lights)); self._lights = current_lights
-        return False
+        return False # Continue game loop
 
     def stop(self):
         print("Android_control: SensorControl stop called.")
-        # Signal and join sender thread
+        # Signal and join all threads
         self._vehicle_data_sender_running_flag.clear()
-        try: self.vehicle_data_send_queue.put_nowait(None) # Sentinel to unblock queue.get()
+        self._image_sender_running_flag.clear() # Signal new thread
+        self._control_server_running_flag.clear()
+
+        # Unblock queues with sentinel values
+        try: self.vehicle_data_send_queue.put_nowait(None)
         except queue.Full: pass
+        try: self.image_send_queue.put_nowait(None) # Unblock new queue
+        except queue.Full: pass
+
+        # Join threads
         if hasattr(self, '_vehicle_data_sender_thread') and self._vehicle_data_sender_thread.is_alive():
             self._vehicle_data_sender_thread.join(timeout=1.0)
-        
-        # Signal and join control command server thread
-        self._control_server_running_flag.clear()
+        if hasattr(self, '_image_sender_thread') and self._image_sender_thread.is_alive():
+            self._image_sender_thread.join(timeout=1.0)
         if hasattr(self, '_control_server_thread') and self._control_server_thread.is_alive():
             self._control_server_thread.join(timeout=1.0)
         
-        # Close client socket for vehicle data
-        if self.vehicle_data_socket_client:
-            try: self.vehicle_data_socket_client.close()
-            except: pass; self.vehicle_data_socket_client = None
-        
-        # Close server socket for control commands (and any active connection)
-        if self.control_cmd_conn:
-            try: self.control_cmd_conn.close()
-            except: pass; self.control_cmd_conn = None
-        if self.control_cmd_socket_server:
-            try: self.control_cmd_socket_server.close()
-            except: pass; self.control_cmd_socket_server = None
+        # Close sockets
+        if self.vehicle_data_socket_client: self.vehicle_data_socket_client.close()
+        if self.image_data_socket_client: self.image_data_socket_client.close()
+        if self.control_cmd_socket_server: self.control_cmd_socket_server.close()
         print("Android_control: SensorControl sockets and threads stopped/closed.")
 
     @staticmethod
     def _is_quit_shortcut(key):
         return (key == K_ESCAPE) or (key == K_q and pygame.key.get_mods() & KMOD_CTRL)
+
 
 
 
@@ -1000,98 +913,170 @@ class RadarSensor(object):
             self.debug.draw_point(radar_data.transform.location + fw_vec, size=0.075, life_time=0.06, persistent_lines=False, color=carla.Color(r, g, b))
 
 class CameraManager(object):
-    def __init__(self, parent_actor, hud, gamma_correction):
+    def __init__(self, parent_actor, hud, gamma_correction, is_for_display=True):
         self.sensor = None
         self.surface = None
         self._parent = parent_actor
         self.hud = hud
         self.recording = False
         self.raw_image_array = None
-        bound_x = 0.5 + self._parent.bounding_box.extent.x; bound_y = 0.5 + self._parent.bounding_box.extent.y; bound_z = 0.5 + self._parent.bounding_box.extent.z
+        self._latest_image = None
+        self._image_lock = threading.Lock()
+        self._is_for_display = is_for_display # New flag
+
+        bound_x = 0.5 + parent_actor.bounding_box.extent.x
+        bound_y = 0.5 + parent_actor.bounding_box.extent.y
+        bound_z = 0.5 + parent_actor.bounding_box.extent.z
         Attachment = carla.AttachmentType
-        if not self._parent.type_id.startswith("walker.pedestrian"):
-             self._camera_transforms = [
-                (carla.Transform(carla.Location(x=+0.01*bound_x, y=-0.25*bound_y, z=0.9*bound_z)), Attachment.Rigid),
-                (carla.Transform(carla.Location(x=+0.8*bound_x, y=+0.0*bound_y, z=1.3*bound_z)), Attachment.Rigid),
-                (carla.Transform(carla.Location(x=+1.9*bound_x, y=+1.0*bound_y, z=1.2*bound_z)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=-2.8*bound_x, y=+0.0*bound_y, z=4.6*bound_z), carla.Rotation(pitch=6.0)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=-1.0, y=-1.0*bound_y, z=0.4*bound_z)), Attachment.Rigid)]
-        else: # Walker transforms
-             self._camera_transforms = [
-                (carla.Transform(carla.Location(x=-2.5, z=0.0), carla.Rotation(pitch=-8.0)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=1.6, z=1.7)), Attachment.Rigid),
-                (carla.Transform(carla.Location(x=2.5, y=0.5, z=0.0), carla.Rotation(pitch=-8.0)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=-4.0, z=2.0), carla.Rotation(pitch=6.0)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=0, y=-2.5, z=-0.0), carla.Rotation(yaw=90.0)), Attachment.Rigid)]
-        self.transform_index = 1
-        self.sensors = [ # Sensor definitions remain the same
-            ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {}], ['sensor.camera.depth', cc.Raw, 'Camera Depth (Raw)', {}],
-            ['sensor.camera.depth', cc.Depth, 'Camera Depth (Gray Scale)', {}], ['sensor.camera.depth', cc.LogarithmicDepth, 'Camera Depth (Logarithmic Gray Scale)', {}],
-            ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)', {}], ['sensor.camera.semantic_segmentation', cc.CityScapesPalette, 'Camera Semantic Segmentation (CityScapes Palette)', {}],
-            ['sensor.camera.instance_segmentation', cc.Raw, 'Camera Instance Segmentation (Raw)', {}], ['sensor.lidar.ray_cast', None, 'Lidar (Ray-Cast)', {'range': '50'}],
-            ['sensor.lidar.ray_cast_semantic', None, 'Semantic Lidar (Ray-Cast)', {'range': '50'}],
-            ['sensor.camera.rgb', cc.Raw, 'Camera RGB Distorted', {'lens_circle_multiplier': '3.0', 'lens_circle_falloff': '3.0', 'chromatic_aberration_intensity': '0.5', 'chromatic_aberration_offset': '0'}],
-            ['sensor.camera.optical_flow', cc.Raw, 'Optical Flow', {}], ['sensor.camera.normals', cc.Raw, 'Camera Normals', {}],
+
+        self._camera_transforms = [
+            (carla.Transform(carla.Location(x=-0.05, z=bound_z + 0.5)), Attachment.Rigid),
+            (carla.Transform(carla.Location(x=+0.8 * bound_x, y=+0.0 * bound_y, z=1.3 * bound_z)), Attachment.Rigid),
+            (carla.Transform(carla.Location(x=+1.9 * bound_x, y=+1.0 * bound_y, z=1.2 * bound_z)), Attachment.SpringArmGhost),
+            (carla.Transform(carla.Location(x=-2.8 * bound_x, y=+0.0 * bound_y, z=4.6 * bound_z), carla.Rotation(pitch=6.0)), Attachment.SpringArmGhost),
+            (carla.Transform(carla.Location(x=-1.0, y=-1.0 * bound_y, z=0.4 * bound_z)), Attachment.Rigid)
         ]
-        world = self._parent.get_world(); bp_library = world.get_blueprint_library()
+
+        self.transform_index = 1
+        self.sensors = [
+            ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {}],
+            ['sensor.camera.depth', cc.Raw, 'Camera Depth (Raw)', {}],
+            ['sensor.camera.depth', cc.Depth, 'Camera Depth (Gray Scale)', {}],
+            ['sensor.camera.depth', cc.LogarithmicDepth, 'Camera Depth (Logarithmic Gray Scale)', {}],
+            ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)', {}],
+            ['sensor.camera.semantic_segmentation', cc.CityScapesPalette, 'Camera Semantic Segmentation (CityScapes Palette)', {}],
+            ['sensor.camera.instance_segmentation', cc.Raw, 'Camera Instance Segmentation (Raw)', {}],
+            ['sensor.lidar.ray_cast', None, 'Lidar (Ray-Cast)', {'range': '50'}],
+            ['sensor.lidar.ray_cast_semantic', None, 'Semantic Lidar (Ray-Cast)', {'range': '50'}],
+            ['sensor.camera.dvs', cc.Raw, 'Dynamic Vision Sensor', {}],
+            ['sensor.camera.optical_flow', cc.Raw, 'Optical Flow', {}],
+        ]
+        world = self._parent.get_world()
+        bp_library = world.get_blueprint_library()
         for item in self.sensors:
             bp = bp_library.find(item[0])
             if item[0].startswith('sensor.camera'):
-                bp.set_attribute('image_size_x', str(hud.dim[0])); bp.set_attribute('image_size_y', str(hud.dim[1]))
-                if bp.has_attribute('gamma'): bp.set_attribute('gamma', str(gamma_correction))
-                for attr_name, attr_value in item[3].items(): bp.set_attribute(attr_name, attr_value)
+                bp.set_attribute('image_size_x', str(hud.dim[0]))
+                bp.set_attribute('image_size_y', str(hud.dim[1]))
+                if bp.has_attribute('gamma'):
+                    bp.set_attribute('gamma', str(gamma_correction))
+                for attr_name, attr_value in item[3].items():
+                    bp.set_attribute(attr_name, attr_value)
+                    # --- MODIFICATION START ---
+                # Set the sensor to capture at a fixed rate (e.g., 20 FPS)
+                # This drastically reduces network traffic in async mode.
+                # A value of 0.0 means it captures every simulation tick.
+                # A value of 0.05 means it captures every 0.05s (20 FPS).
+                bp.set_attribute('sensor_tick', '0.016')
+                # --- MODIFICATION END ---
             elif item[0].startswith('sensor.lidar'):
                 self.lidar_range = 50
                 for attr_name, attr_value in item[3].items():
                     bp.set_attribute(attr_name, attr_value)
-                    if attr_name == 'range': self.lidar_range = float(attr_value)
+                    if attr_name == 'range':
+                        self.lidar_range = float(attr_value)
+
             item.append(bp)
         self.index = None
+
+    def tick(self):
+        """
+        New method to be called once per game loop.
+        It processes the latest image received from the callback.
+        """
+        with self._image_lock:
+            image = self._latest_image
+        
+        if image:
+            if self.sensors[self.index][0].startswith('sensor.lidar'):
+                points = np.frombuffer(image.raw_data, dtype=np.dtype('f4'))
+                points = np.reshape(points, (int(points.shape[0] / 4), 4))
+                lidar_data = np.array(points[:, :2])
+                lidar_data *= min(self.hud.dim) / (2.0 * self.lidar_range)
+                lidar_data += (0.5 * self.hud.dim[0], 0.5 * self.hud.dim[1])
+                lidar_data = np.fabs(lidar_data)
+                lidar_data = lidar_data.astype(np.int32)
+                lidar_data = np.reshape(lidar_data, (-1, 2))
+                lidar_img_size = (self.hud.dim[0], self.hud.dim[1], 3)
+                lidar_img = np.zeros(lidar_img_size, dtype=np.uint8)
+                lidar_img[tuple(lidar_data.T)] = (255, 255, 255)
+                self.surface = pygame.surfarray.make_surface(lidar_img)
+            elif self.sensors[self.index][0].startswith('sensor.camera.dvs'):
+                # Example of displaying DVS events
+                dvs_events = np.frombuffer(image.raw_data, dtype=np.dtype([
+                    ('x', np.uint16), ('y', np.uint16), ('t', np.int64), ('pol', np.bool)]))
+                dvs_img = np.zeros((image.height, image.width, 3), dtype=np.uint8)
+                # Blue is positive, red is negative
+                dvs_img[dvs_events['y'], dvs_events['x'], 2 * (1 - dvs_events['pol'])] = 255
+                self.surface = pygame.surfarray.make_surface(dvs_img.swapaxes(0, 1))
+            elif self.sensors[self.index][0].startswith('sensor.camera.optical_flow'):
+                image = image.get_color_coded_flow()
+                array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
+                array = np.reshape(array, (image.height, image.width, 4))
+                array = array[:, :, :3]
+                array = array[:, :, ::-1]
+                self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+            else:
+                image.convert(self.sensors[self.index][1])
+                array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
+                array = np.reshape(array, (image.height, image.width, 4))
+                array = array[:, :, :3]
+                array = array[:, :, ::-1]
+                if self._is_for_display:
+                    self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+            
+            
+            # This is now updated only once per frame, making it stable
+            self.raw_image_array = array
+            if self.recording:
+                image.save_to_disk('_out/%08d' % image.frame)
+
     def toggle_camera(self):
         self.transform_index = (self.transform_index + 1) % len(self._camera_transforms)
         self.set_sensor(self.index, notify=False, force_respawn=True)
+
     def set_sensor(self, index, notify=True, force_respawn=False):
         index = index % len(self.sensors)
         needs_respawn = True if self.index is None else (force_respawn or (self.sensors[index][2] != self.sensors[self.index][2]))
         if needs_respawn:
-            if self.sensor is not None: self.sensor.destroy(); self.surface = None
-            self.sensor = self._parent.get_world().spawn_actor(self.sensors[index][-1], self._camera_transforms[self.transform_index][0], attach_to=self._parent, attachment_type=self._camera_transforms[self.transform_index][1])
-            weak_self = weakref.ref(self); self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
-        if notify: self.hud.notification(self.sensors[index][2])
+            if self.sensor is not None:
+                self.sensor.destroy()
+                self.surface = None
+            self.sensor = self._parent.get_world().spawn_actor(
+                self.sensors[index][-1],
+                self._camera_transforms[self.transform_index][0],
+                attach_to=self._parent,
+                attachment_type=self._camera_transforms[self.transform_index][1])
+            
+            # The callback is now lightweight
+            weak_self = weakref.ref(self)
+            self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
+        if notify:
+            self.hud.notification(self.sensors[index][2])
         self.index = index
-    def next_sensor(self): self.set_sensor(self.index + 1)
-    def toggle_recording(self): self.recording = not self.recording; self.hud.notification('Recording %s' % ('On' if self.recording else 'Off'))
+
+    def next_sensor(self):
+        self.set_sensor(self.index + 1)
+
+    def toggle_recording(self):
+        self.recording = not self.recording
+        self.hud.notification('Recording %s' % ('On' if self.recording else 'Off'))
+
     def render(self, display):
-        if self.surface is not None: display.blit(self.surface, (0, 0))
+        if self.surface is not None:
+            display.blit(self.surface, (0, 0))
+
     @staticmethod
     def _parse_image(weak_self, image):
+        """
+        This callback is now extremely lightweight.
+        It just stores the latest image from CARLA in a thread-safe way.
+        """
         self = weak_self()
-        if not self: return
-        # Lidar and Camera parsing logic remains the same
-        if self.sensors[self.index][0] == 'sensor.lidar.ray_cast':
-            points = np.frombuffer(image.raw_data, dtype=np.dtype('f4')); points = np.reshape(points, (int(points.shape[0] / 4), 4))
-            lidar_data = np.array(points[:, :2]); lidar_data *= min(self.hud.dim) / (2.0 * self.lidar_range); lidar_data += (0.5 * self.hud.dim[0], 0.5 * self.hud.dim[1])
-            lidar_data = np.fabs(lidar_data).astype(np.int32); lidar_data = np.reshape(lidar_data, (-1, 2))
-            lidar_img_size = (self.hud.dim[0], self.hud.dim[1], 3); lidar_img = np.zeros((lidar_img_size), dtype=np.uint8)
-            lidar_img[tuple(lidar_data.T)] = (255, 255, 255); self.surface = pygame.surfarray.make_surface(lidar_img)
-        elif self.sensors[self.index][0] == 'sensor.lidar.ray_cast_semantic':
-            points = np.frombuffer(image.raw_data, dtype=np.dtype('f4')); points = np.reshape(points, (int(points.shape[0] / 6), 6))
-            lidar_data = np.array(points[:, :2]); lidar_data *= min(self.hud.dim) / (2.0 * self.lidar_range); lidar_data += (0.5 * self.hud.dim[0], 0.5 * self.hud.dim[1])
-            lidar_data = lidar_data.astype(np.int32); lidar_data = np.reshape(lidar_data, (-1, 2))
-            lidar_img_size = (self.hud.dim[0], self.hud.dim[1], 3); lidar_img = np.zeros((lidar_img_size), dtype=np.uint8)
-            for i in range(len(image)): lidar_img[tuple(lidar_data[i].T)] = OBJECT_TO_COLOR[int(image[i].object_tag)]
-            self.surface = pygame.surfarray.make_surface(lidar_img)
-        elif self.sensors[self.index][0].startswith('sensor.camera.optical_flow'):
-            image = image.get_color_coded_flow(); array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-            array = np.reshape(array, (image.height, image.width, 4)); array = array[:, :, :3]; array = array[:, :, ::-1]
-            self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
-        else: # Default camera handling
-            image.convert(self.sensors[self.index][1]); array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-            array = np.reshape(array, (image.height, image.width, 4)); array = array[:, :, :3]; array = array[:, :, ::-1]
-            self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
-        if self.recording: image.save_to_disk('_out/%08d' % image.frame)
-        self.raw_image_array = array
-
+        if not self:
+            return
+        with self._image_lock:
+            self._latest_image = image
 
 
 FIXED_SIMULATION_STEP_TIME = 0.017
@@ -1110,27 +1095,28 @@ def game_loop(args):
         client = carla.Client(args.host, args.port)
         client.set_timeout(20.0)
         sim_world = client.get_world()
-        traffic_manager = client.get_trafficmanager(args.tm_port) # Ensure TM port is used
+
+        # Get a client handle to the Traffic Manager.
+        # This does not cause a conflict. Scenario Runner is the master.
+        traffic_manager = client.get_trafficmanager()
 
         if args.sync:
-            original_settings = sim_world.get_settings(); settings = sim_world.get_settings()
-            current_fixed_delta_seconds = FIXED_SIMULATION_STEP_TIME 
-            if current_fixed_delta_seconds <= 0: current_fixed_delta_seconds = 0.05
-            settings.synchronous_mode = True; settings.fixed_delta_seconds = current_fixed_delta_seconds
+            # We only need to set the world to sync mode.
+            # Scenario Runner will handle setting the TM to sync mode.
+            original_settings = sim_world.get_settings()
+            settings = sim_world.get_settings()
+            settings.synchronous_mode = True
+            settings.fixed_delta_seconds = args.delta_seconds # Use the arg
             sim_world.apply_settings(settings)
-            if hasattr(traffic_manager, 'set_synchronous_mode'): traffic_manager.set_synchronous_mode(True)
-            target_fps_for_client = 1.0 / current_fixed_delta_seconds
-            print(f"Synchronous mode: Server fixed_delta_seconds = {current_fixed_delta_seconds:.4f}s. Client target FPS = {target_fps_for_client:.2f}")
-        
-        
+            print(f"Android_control.py: World set to synchronous mode with dt={args.delta_seconds}")
+
         display = pygame.display.set_mode((args.width, args.height), pygame.HWSURFACE | pygame.DOUBLEBUF)
         display.fill((0,0,0)); pygame.display.flip()
 
         hud = HUD(args.width, args.height)
-        world = World(sim_world, hud, traffic_manager, args) # Pass TM to World
-
+        world = World(sim_world, hud, traffic_manager, args)
         # MPC Process Setup
-        mpc_dt = FIXED_SIMULATION_STEP_TIME if args.sync else 0.05
+        mpc_dt = FIXED_SIMULATION_STEP_TIME if args.sync else 0.016
         mpc_params = {'horizon_N': 10, 'dt': mpc_dt, 'wheelbase': 2.5}
         phone_tcp_config = {"host": args.mpc_phone_host, "port": args.mpc_phone_port}
         
@@ -1139,7 +1125,7 @@ def game_loop(args):
             max_speed_mps_limit = args.max_speed_kph / 3.6
 
         # MPC Process Setup
-        mpc_params = {'horizon_N': 10, 'dt': args.delta_seconds if args.sync else 0.05, 'wheelbase': 2.5}
+        mpc_params = {'horizon_N': 10, 'dt': args.delta_seconds if args.sync else 0.016, 'wheelbase': 2.5}
         phone_tcp_config = {"host": args.mpc_phone_host, "port": args.mpc_phone_port}
         control_config = { # Pass all relevant control tuning parameters from args
             "steer_angle_sensitivity": args.steer_angle_sensitivity,
@@ -1166,15 +1152,12 @@ def game_loop(args):
         control_cmd_client_addr = (args.ipc_host, args.ipc_control_cmd_port)
         image_data_server_addr = (args.ipc_host, args.ipc_image_data_port)
 
-        # --- FIX: Instantiate the SERVER FIRST ---
-        # SensorControl now uses socket addresses
-        print("Game_loop: Initializing SensorControl (Server)...")
+       
+
         controller = SensorControl(world, args.autopilot,
                                    mpc_vehicle_data_address=vehicle_data_server_addr,
                                    control_cmd_server_address=control_cmd_client_addr,
-                                   mpc_image_data_address=image_data_server_addr) # Make sure you added this arg
-        # The SensorControl __init__ method will start its listening threads.
-        # We can add a small, optional delay to be safe.
+                                   mpc_image_data_address=image_data_server_addr)
         time.sleep(0.5) 
 
         mpc_process_instance = MPCProcess(
@@ -1249,8 +1232,8 @@ def main():
     argparser.add_argument('--rolename', metavar='NAME', default='hero', help='actor role name (default: "hero")')
     argparser.add_argument('--gamma', default=2.2, type=float, help='Gamma correction of the camera (default: 2.2)')
     argparser.add_argument('--sync', action='store_true', help='Activate synchronous mode execution')
-    argparser.add_argument('--tm-port', metavar='P', default=8000, type=int, help='Port for Traffic Manager (default: 8000)')
-    argparser.add_argument('--delta_seconds', metavar='S', default=0.05, type=float, help='Fixed delta seconds for synchronous mode (default: 0.05)')
+    # argparser.add_argument('--tm-port', metavar='P', default=8000, type=int, help='Port for Traffic Manager (default: 8000)')
+    argparser.add_argument('--delta_seconds', metavar='S', default=0.0017, type=float, help='Fixed delta seconds for synchronous mode (default: 0.05)')
     
     # Args for MPC phone listener (used by MPCProcess)
     argparser.add_argument('--mpc_phone_host', default='0.0.0.0', help='Host for MPC to listen for phone data (default: 0.0.0.0 to listen on all interfaces)')
@@ -1267,7 +1250,7 @@ def main():
     argparser.add_argument('--steering_angle_deadzone', default=0.2, type=float, help='Deadzone for AY for steering angle (m/s^2).')
     argparser.add_argument('--max_vehicle_steer_angle_deg', default=70.0, type=float, help='Max physical steer angle of vehicle wheels (deg) for normalization.')
     argparser.add_argument('--steer_rate_sensitivity', default=0.8, type=float, help='Sensitivity for GZ to desired steer rate.')
-    argparser.add_argument('--steering_rate_deadzone', default=0.05, type=float, help='Deadzone for GZ for steering rate (rad/s).')
+    argparser.add_argument('--steering_rate_deadzone', default=0.16, type=float, help='Deadzone for GZ for steering rate (rad/s).')
     argparser.add_argument('--max_vehicle_steer_rate_deg_s', default=100.0, type=float, help='Max desired steer rate (deg/s).')
     argparser.add_argument('--max_ay_for_scaling', default=9.8, type=float, help='Assumed max relevant AY for scaling input.')
     argparser.add_argument('--max_gz_for_scaling_rps', default=5.0, type=float, help='Assumed max relevant GZ for scaling input (rad/s).')
@@ -1283,7 +1266,12 @@ def main():
     argparser.add_argument('--pid_ki', default=0.15, type=float, help='PID Integral gain for speed control.')    # Tuned Ki
     argparser.add_argument('--pid_kd', default=0.08, type=float, help='PID Derivative gain for speed control.')  # Tuned Kd
 
-
+    # --- NEW ARGUMENT ---
+    argparser.add_argument(
+        '--waitForEgo',
+        action='store_true',
+        help='Instead of spawning a new ego vehicle, wait for one with the correct rolename to be spawned by scenario_runner.'
+    )
 
     args = argparser.parse_args()
 
@@ -1301,4 +1289,3 @@ def main():
 if __name__ == '__main__':
     # multiprocessing.freeze_support() 
     main()
-

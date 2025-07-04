@@ -1,0 +1,7 @@
+Log Entry,Timestamp
+Starting up services,10:00:01
+MPC Loop Avg Processing Time: 0.0152,10:00:02
+Sensor data received,10:00:03
+  MPC Loop Avg Processing Time: 0.0149  ,10:00:04
+MPC Loop Avg Processing Time: not_a_number,10:00:05
+MPC Loop Avg Processing Time: 0.0210,10:00:06

@@ -10,6 +10,7 @@
 
 """
 Welcome to CARLA manual control with steering wheel Logitech G29.
+This script is now scenario-ready.
 
 To drive start by preshing the brake pedal.
 Change your wheel_config.ini according to your steering wheel.
@@ -29,6 +30,7 @@ from __future__ import print_function
 import glob
 import os
 import sys
+import time
 
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
@@ -94,6 +96,8 @@ try:
     from pygame.locals import K_r
     from pygame.locals import K_s
     from pygame.locals import K_w
+    from pygame.locals import K_MINUS
+    from pygame.locals import K_EQUALS
 except ImportError:
     raise RuntimeError('cannot import pygame, make sure pygame package is installed')
 
@@ -126,42 +130,47 @@ def get_actor_display_name(actor, truncate=250):
 
 
 class World(object):
-    def __init__(self, carla_world, hud, actor_filter):
+    def __init__(self, carla_world, hud, args):
         self.world = carla_world
+        try:
+            self.map = self.world.get_map()
+        except RuntimeError as error:
+            print('RuntimeError: {}'.format(error))
+            print('  The server could not send the OpenDRIVE (.xodr) file:')
+            print('  Make sure it exists, has the same name of your town, and is correct.')
+            sys.exit(1)
         self.hud = hud
         self.player = None
+        self.player_name = None
         self.collision_sensor = None
         self.lane_invasion_sensor = None
         self.gnss_sensor = None
         self.camera_manager = None
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
-        self._actor_filter = actor_filter
-        self.restart()
+        self.restart(args)
         self.world.on_tick(hud.on_world_tick)
+        self.recording_enabled = False
+        self.recording_start = 0
 
-    def restart(self):
+    def restart(self, args):
         # Keep same camera config if the camera manager exists.
         cam_index = self.camera_manager.index if self.camera_manager is not None else 0
         cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
-        # Get a random blueprint.
-        blueprint = random.choice(self.world.get_blueprint_library().filter(self._actor_filter))
-        blueprint.set_attribute('role_name', 'hero')
-        if blueprint.has_attribute('color'):
-            color = random.choice(blueprint.get_attribute('color').recommended_values)
-            blueprint.set_attribute('color', color)
-        # Spawn the player.
-        if self.player is not None:
-            spawn_point = self.player.get_transform()
-            spawn_point.location.z += 2.0
-            spawn_point.rotation.roll = 0.0
-            spawn_point.rotation.pitch = 0.0
-            self.destroy()
-            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
+
+        # Get the ego vehicle
         while self.player is None:
-            spawn_points = self.world.get_map().get_spawn_points()
-            spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
-            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
+            print("Waiting for the ego vehicle...")
+            time.sleep(1)
+            possible_vehicles = self.world.get_actors().filter('vehicle.*')
+            for vehicle in possible_vehicles:
+                if vehicle.attributes['role_name'] == args.rolename:
+                    print("Ego vehicle found")
+                    self.player = vehicle
+                    break
+        
+        self.player_name = self.player.type_id
+
         # Set up the sensors.
         self.collision_sensor = CollisionSensor(self.player, self.hud)
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
@@ -172,6 +181,9 @@ class World(object):
         actor_type = get_actor_display_name(self.player)
         self.hud.notification(actor_type)
 
+        self.world.wait_for_tick()
+
+
     def next_weather(self, reverse=False):
         self._weather_index += -1 if reverse else 1
         self._weather_index %= len(self._weather_presets)
@@ -179,12 +191,26 @@ class World(object):
         self.hud.notification('Weather: %s' % preset[1])
         self.player.get_world().set_weather(preset[0])
 
-    def tick(self, clock):
+    def tick(self, clock, wait_for_repetitions):
+        if len(self.world.get_actors().filter(self.player_name)) < 1:
+            if not wait_for_repetitions:
+                return False
+            else:
+                self.player = None
+                self.destroy()
+                self.restart()
+
         self.hud.tick(self, clock)
+        return True
 
     def render(self, display):
         self.camera_manager.render(display)
         self.hud.render(display)
+
+    def destroy_sensors(self):
+        self.camera_manager.sensor.destroy()
+        self.camera_manager.sensor = None
+        self.camera_manager.index = None
 
     def destroy(self):
         sensors = [
@@ -240,7 +266,7 @@ class DualControl(object):
         self._handbrake_idx = int(
             self._parser.get('G29 Racing Wheel', 'handbrake'))
 
-    def parse_events(self, world, clock):
+    def parse_events(self, client, world, clock):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return True
@@ -262,7 +288,8 @@ class DualControl(object):
                 if self._is_quit_shortcut(event.key):
                     return True
                 elif event.key == K_BACKSPACE:
-                    world.restart()
+                    # world.restart() #This is removed to avoid conflict with scenario runner
+                    pass
                 elif event.key == K_F1:
                     world.hud.toggle_info()
                 elif event.key == K_h or (event.key == K_SLASH and pygame.key.get_mods() & KMOD_SHIFT):
@@ -277,8 +304,44 @@ class DualControl(object):
                     world.camera_manager.next_sensor()
                 elif event.key > K_0 and event.key <= K_9:
                     world.camera_manager.set_sensor(event.key - 1 - K_0)
-                elif event.key == K_r:
+                elif event.key == K_r and not (pygame.key.get_mods() & KMOD_CTRL):
                     world.camera_manager.toggle_recording()
+                elif event.key == K_r and (pygame.key.get_mods() & KMOD_CTRL):
+                    if (world.recording_enabled):
+                        client.stop_recorder()
+                        world.recording_enabled = False
+                        world.hud.notification("Recorder is OFF")
+                    else:
+                        client.start_recorder("manual_recording.rec")
+                        world.recording_enabled = True
+                        world.hud.notification("Recorder is ON")
+                elif event.key == K_p and (pygame.key.get_mods() & KMOD_CTRL):
+                    # stop recorder
+                    client.stop_recorder()
+                    world.recording_enabled = False
+                    # work around to fix camera at start of replaying
+                    current_index = world.camera_manager.index
+                    world.destroy_sensors()
+                    # disable autopilot
+                    self._autopilot_enabled = False
+                    world.player.set_autopilot(self._autopilot_enabled)
+                    world.hud.notification("Replaying file 'manual_recording.rec'")
+                    # replayer
+                    client.replay_file("manual_recording.rec", world.recording_start, 0, 0)
+                    world.camera_manager.set_sensor(current_index)
+                elif event.key == K_MINUS and (pygame.key.get_mods() & KMOD_CTRL):
+                    if pygame.key.get_mods() & KMOD_SHIFT:
+                        world.recording_start -= 10
+                    else:
+                        world.recording_start -= 1
+                    world.hud.notification("Recording start time is %d" % (world.recording_start))
+                elif event.key == K_EQUALS and (pygame.key.get_mods() & KMOD_CTRL):
+                    if pygame.key.get_mods() & KMOD_SHIFT:
+                        world.recording_start += 10
+                    else:
+                        world.recording_start += 1
+                    world.hud.notification("Recording start time is %d" % (world.recording_start))
+
                 if isinstance(self._control, carla.VehicleControl):
                     if event.key == K_q:
                         self._control.gear = 1 if self._control.reverse else -1
@@ -291,7 +354,7 @@ class DualControl(object):
                         self._control.gear = max(-1, self._control.gear - 1)
                     elif self._control.manual_gear_shift and event.key == K_PERIOD:
                         self._control.gear = self._control.gear + 1
-                    elif event.key == K_p:
+                    elif event.key == K_p and not pygame.key.get_mods() & KMOD_CTRL:
                         self._autopilot_enabled = not self._autopilot_enabled
                         world.player.set_autopilot(self._autopilot_enabled)
                         world.hud.notification('Autopilot %s' % ('On' if self._autopilot_enabled else 'Off'))
@@ -322,16 +385,13 @@ class DualControl(object):
     def _parse_vehicle_wheel(self):
         numAxes = self._joystick.get_numaxes()
         jsInputs = [float(self._joystick.get_axis(i)) for i in range(numAxes)]
-        # print (jsInputs)
         jsButtons = [float(self._joystick.get_button(i)) for i in
                      range(self._joystick.get_numbuttons())]
 
-        # Custom function to map range of inputs [1, -1] to outputs [0, 1] i.e 1 from inputs means nothing is pressed
-        # For the steering, it seems fine as it is
-        K1 = 1.0  # 0.55
+        K1 = 1.0
         steerCmd = K1 * math.tan(1.1 * jsInputs[self._steer_idx])
 
-        K2 = 1.6  # 1.6
+        K2 = 1.6
         throttleCmd = K2 + (2.05 * math.log10(
             -0.7 * jsInputs[self._throttle_idx] + 1.4) - 1.2) / 0.92
         if throttleCmd <= 0:
@@ -349,9 +409,6 @@ class DualControl(object):
         self._control.steer = steerCmd
         self._control.brake = brakeCmd
         self._control.throttle = throttleCmd
-
-        #toggle = jsButtons[self._reverse_idx]
-
         self._control.hand_brake = bool(jsButtons[self._handbrake_idx])
 
     def _parse_walker_keys(self, keys, milliseconds):
@@ -426,7 +483,7 @@ class HUD(object):
             'Client:  % 16.0f FPS' % clock.get_fps(),
             '',
             'Vehicle: % 20s' % get_actor_display_name(world.player, truncate=20),
-            'Map:     % 20s' % world.world.get_map().name.split('/')[-1],
+            'Map:     % 20s' % world.map.name.split('/')[-1],
             'Simulation time: % 12s' % datetime.timedelta(seconds=int(self.simulation_time)),
             '',
             'Speed:   % 15.0f km/h' % (3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)),
@@ -776,28 +833,40 @@ def game_loop(args):
 
     try:
         client = carla.Client(args.host, args.port)
-        client.set_timeout(2.0)
+        client.set_timeout(20.0)
+        sim_world = client.get_world()
 
         display = pygame.display.set_mode(
             (args.width, args.height),
             pygame.HWSURFACE | pygame.DOUBLEBUF)
+        display.fill((0,0,0))
+        pygame.display.flip()
 
         hud = HUD(args.width, args.height)
-        world = World(client.get_world(), hud, args.filter)
+        world = World(client.get_world(), hud, args)
         controller = DualControl(world, args.autopilot)
+
+        sim_world.wait_for_tick()
 
         clock = pygame.time.Clock()
         while True:
             clock.tick_busy_loop(60)
-            if controller.parse_events(world, clock):
+            if controller.parse_events(client, world, clock):
                 return
-            world.tick(clock)
+            if not world.tick(clock, args.wait_for_repetitions):
+                return
             world.render(display)
             pygame.display.flip()
 
     finally:
 
+        if (world and world.recording_enabled):
+            client.stop_recorder()
+
         if world is not None:
+            # prevent destruction of ego vehicle
+            if args.keep_ego_vehicle:
+                world.player = None
             world.destroy()
 
         pygame.quit()
@@ -810,7 +879,7 @@ def game_loop(args):
 
 def main():
     argparser = argparse.ArgumentParser(
-        description='CARLA Manual Control Client')
+        description='CARLA Manual Control Client with Steering Wheel')
     argparser.add_argument(
         '-v', '--verbose',
         action='store_true',
@@ -830,17 +899,25 @@ def main():
     argparser.add_argument(
         '-a', '--autopilot',
         action='store_true',
-        help='enable autopilot')
+        help='enable autopilot. This does not autocomplete the scenario')
+    argparser.add_argument(
+        '--rolename',
+        metavar='NAME',
+        default='hero',
+        help='role name of ego vehicle to control (default: "hero")')
     argparser.add_argument(
         '--res',
         metavar='WIDTHxHEIGHT',
         default='1280x720',
         help='window resolution (default: 1280x720)')
     argparser.add_argument(
-        '--filter',
-        metavar='PATTERN',
-        default='vehicle.*',
-        help='actor filter (default: "vehicle.*")')
+        '--keep_ego_vehicle',
+        action='store_true',
+        help='do not destroy ego vehicle on exit')
+    argparser.add_argument(
+        '--wait-for-repetitions',
+        action='store_true',
+        help='Avoids stopping the manual control when the scenario ends.')
     args = argparser.parse_args()
 
     args.width, args.height = [int(x) for x in args.res.split('x')]
