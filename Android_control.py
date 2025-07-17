@@ -1260,7 +1260,7 @@ def main():
     argparser.add_argument('--data_history_size', default=5, type=int, help="Number of samples for WMA filter in MPC.")
 
     # ---- New Args for Gradual Throttle & PID ----
-    argparser.add_argument('--throttle_increase_rate', default=0.5, type=float, help='Rate at which throttle increases (units/sec) when accel is pressed.')
+    argparser.add_argument('--throttle_increase_rate', default=0.7, type=float, help='Rate at which throttle increases (units/sec) when accel is pressed.')
     argparser.add_argument('--throttle_decrease_rate', default=1.0, type=float, help='Rate at which throttle decreases (units/sec) when accel is released.')
     argparser.add_argument('--pid_kp', default=0.6, type=float, help='PID Proportional gain for speed control.') # Tuned Kp
     argparser.add_argument('--pid_ki', default=0.15, type=float, help='PID Integral gain for speed control.')    # Tuned Ki

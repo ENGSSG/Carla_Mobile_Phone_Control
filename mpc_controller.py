@@ -206,7 +206,7 @@ def vehicle_model(state, control_input, dt):
 
 
 class LaneKeepingAssist:
-    def __init__(self, dt, kp=0.1, ki=0.0008, kd=0.0001):
+    def __init__(self, dt, kp=0.0015,ki=0.00001, kd=0.00008):
         """
         Initializes the LKA system using the generic PIDController.
         :param dt: The time step (delta time) for the PID derivative calculation.
@@ -240,7 +240,7 @@ class LaneKeepingAssist:
     def process_frame(self, frame):
         """
         Processes a single camera frame to find lane lines and calculate steering correction.
-        If current lines aren't found, it uses the last known lines for a short duration.
+        Uses advanced techniques like HLS color space, polynomial fitting, and temporal smoothing.
         Returns a steering correction value between -1.0 (steer left) and 1.0 (steer right).
         """
         if frame is None:
@@ -249,58 +249,114 @@ class LaneKeepingAssist:
  
         h, w, _ = frame.shape
         
-        # 1. Image processing (ROI, grayscale, blur, Canny, Hough)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # 1. Enhanced image processing pipeline
+        
+        # Convert to HLS color space for better lane marking detection
+        hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+        l_channel = hls[:,:,1]
+        s_channel = hls[:,:,2]
+        
+        # Apply contrast enhancement to lightness channel
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        contrast_enhanced_gray = clahe.apply(gray)
-        blur = cv2.GaussianBlur(contrast_enhanced_gray, (3, 3), 0)
-        edges = cv2.Canny(blur, 50, 150)
-        kernel = np.ones((3,3), np.uint8)
+        l_channel_enhanced = clahe.apply(l_channel)
+        
+        # Combine enhanced L channel with original S channel for better lane marking detection
+        # Saturation channel helps highlight white and yellow lines
+        combined_binary = np.zeros_like(s_channel)
+        combined_binary[(l_channel_enhanced > 120) | (s_channel > 120)] = 255
+        
+        # Apply Gaussian blur
+        blur = cv2.GaussianBlur(combined_binary, (5, 5), 0)
+        
+        # Canny edge detection with adaptive thresholds
+        v = np.median(blur)
+        sigma = 0.33
+        lower = int(max(0, (1.0 - sigma) * v))
+        upper = int(min(255, (1.0 + sigma) * v))
+        edges = cv2.Canny(blur, lower, upper)
+        
+        # Edge dilation for better connectivity
+        kernel = np.ones((5,5), np.uint8)
         dilated_edges = cv2.dilate(edges, kernel, iterations=1)
         
-        roi_vertices = np.array([[(0, h), (w/2, h/2), (w, h)]], dtype=np.int32)
-        mask = np.zeros_like(dilated_edges)
+        # Define a trapezoidal region of interest (slightly adjusted for better lane capture)
+        roi_vertices = np.array([[(int(w*0.2), h*0.85), (int(w*0.4), int(h*0.5)), 
+                                  (int(w*0.6), int(h*0.5)), (int(w*0.8), h*0.85)]], dtype=np.int32)
+        
+        # Create ROI mask and apply
+        mask = np.zeros_like(edges)
         cv2.fillPoly(mask, roi_vertices, 255)
         masked_image = cv2.bitwise_and(dilated_edges, mask)
         
-        lines = cv2.HoughLinesP(masked_image, 1, np.pi/180, 120, minLineLength=30, maxLineGap=200)
+        # Improved Hough parameters for better line detection
+        lines = cv2.HoughLinesP(masked_image, rho=1, theta=np.pi/180, threshold=35, 
+                               minLineLength=25, maxLineGap=150)
         
-        # --- MODIFICATION START ---
-        # Logic to detect, store, and recall lane lines
+        # --- IMPROVED LANE DETECTION START ---
+        # Enhanced logic with better filtering and polynomial fitting
         
         lines_detected_this_frame = False
         poly_left_to_use = None
         poly_right_to_use = None
+        
+        # Initialize sliding window parameters
+        n_windows = 9
+        window_height = h // n_windows
+        margin = 100  # Width of the windows
+        min_pixels = 30  # Minimum number of pixels to recenter window
 
         if lines is not None:
-            # 2. Separate and fit lines using polyfit
+            # Separate lines into left and right candidates
             left_line_x, left_line_y = [], []
             right_line_x, right_line_y = [], []
-    
+            
+            # Improved filtering with angle and position checks
             for line in lines:
                 for x1, y1, x2, y2 in line:
                     if x2 == x1: 
                         continue
+                    
+                    # Calculate slope and lane position
                     slope = (y2 - y1) / (x2 - x1)
-                    if abs(slope) < 0.6: # Filter out horizontal lines
+                    
+                    # Filter out horizontal-ish lines and very steep lines
+                    if abs(slope) < 0.4 or abs(slope) > 5: 
                         continue
-                    if slope <= 0: # Left lane
+                    
+                    # Determine lane side based on position and slope
+                    midpoint = w / 2
+                    x_mid = (x1 + x2) / 2
+                    
+                    # More robust classification using both slope and position
+                    if (slope <= 0 and x_mid < midpoint) or (slope <= 0 and x_mid < midpoint * 1.2):
+                        # Left lane (negative slope and generally on the left side)
                         left_line_x.extend([x1, x2])
                         left_line_y.extend([y1, y2])
-                    else: # Right lane
+                    elif (slope > 0 and x_mid > midpoint) or (slope > 0 and x_mid > midpoint * 0.8):
+                        # Right lane (positive slope and generally on the right side)
                         right_line_x.extend([x1, x2])
                         right_line_y.extend([y1, y2])
             
-            # If we have points for both lanes, we have a successful detection
-            if left_line_y and right_line_y:
-                # Fit a 1st degree polynomial (a line) to the points
-                self.last_poly_left = np.poly1d(np.polyfit(left_line_y, left_line_x, deg=1))
-                self.last_poly_right = np.poly1d(np.polyfit(right_line_y, right_line_x, deg=1))
+            # If we have enough points for both lanes, fit polynomials
+            if len(left_line_y) > min_pixels and len(right_line_y) > min_pixels:
+                # Use quadratic fit for better handling of curves (degree 2)
+                self.last_poly_left = np.poly1d(np.polyfit(left_line_y, left_line_x, deg=2))
+                self.last_poly_right = np.poly1d(np.polyfit(right_line_y, right_line_x, deg=2))
                 self.last_detection_time = time.time()
                 lines_detected_this_frame = True
+                
+                # Store confidence about the detection quality
+                if not hasattr(self, 'detection_confidence'):
+                    self.detection_confidence = 0.8
+                else:
+                    # Increase confidence for good detections
+                    self.detection_confidence = min(1.0, self.detection_confidence + 0.2)
 
-        # Determine which polynomials to use for calculation
+        # --- IMPROVED LANE HANDLING START ---
+        # Enhanced algorithm for determining which polynomials to use with confidence metrics
+        
         if lines_detected_this_frame:
+            # Use the newly detected lines
             poly_left_to_use = self.last_poly_left
             poly_right_to_use = self.last_poly_right
         else:
@@ -308,64 +364,140 @@ class LaneKeepingAssist:
             is_last_lines_valid = (self.last_poly_left is not None and 
                                    self.last_poly_right is not None and
                                    (time.time() - self.last_detection_time) < self.max_line_age_seconds)
+            
             if is_last_lines_valid:
-                # Use the stored polynomials
+                # Use the stored polynomials, but decrease confidence
                 poly_left_to_use = self.last_poly_left
                 poly_right_to_use = self.last_poly_right
+                
+                # Decrease confidence when using recalled lines
+                if hasattr(self, 'detection_confidence'):
+                    time_since_detection = time.time() - self.last_detection_time
+                    decay_factor = 1.0 - (time_since_detection / self.max_line_age_seconds)
+                    self.detection_confidence = max(0.1, self.detection_confidence * decay_factor)
             else:
                 # No new lines and no valid old lines. Reset and exit.
                 self.pid_controller.reset()
-                self.last_poly_left = None # Invalidate them now
+                self.last_poly_left = None  # Invalidate them now
                 self.last_poly_right = None
-                return 0.0, None # Return no correction and no display image
+                if hasattr(self, 'detection_confidence'):
+                    self.detection_confidence = 0.0
+                return 0.0, None  # Return no correction and no display image
 
-        # --- MODIFICATION END ---
+        # --- IMPROVED LANE HANDLING END ---
+        
+        # 3. Calculate Error with multiple evaluation points
+        # Evaluate the polynomials at multiple heights for better accuracy
+        y_eval_points = [int(h * 0.8), int(h * 0.7), int(h * 0.6)]
+        lane_centers = []
+        
+        for y_eval in y_eval_points:
+            # For quadratic polynomials, this properly handles curves
+            left_x = int(poly_left_to_use(y_eval))
+            right_x = int(poly_right_to_use(y_eval))
+            lane_centers.append((left_x + right_x) / 2)
             
-        # 3. Calculate Error (using the chosen polynomials)
-        # Evaluate the line equations at a specific y-coordinate to find the lane center
-        y_eval = int(h * 0.8)
-        left_x = int(poly_left_to_use(y_eval))
-        right_x = int(poly_right_to_use(y_eval))
+        # Weight closer points (lower in the image) more heavily
+        weighted_lane_center = (lane_centers[0] * 0.6 + 
+                                lane_centers[1] * 0.3 + 
+                                lane_centers[2] * 0.1)
         
-        # Calculate lane center with WMA
-        wma_size = 10 # Keep a history of last 5 lane center values
-        if not hasattr(self, 'lane_center_history'): self.lane_center_history = collections.deque(maxlen=wma_size)
-        self.lane_center_history.append((left_x + right_x) / 2)
-        lane_center_x = np.average(self.lane_center_history, weights=np.arange(1, len(self.lane_center_history) + 1))
+        # Enhanced temporal smoothing with confidence-weighted moving average
+        wma_size = 10  # Keep history of last 10 lane center values
+        if not hasattr(self, 'lane_center_history'): 
+            self.lane_center_history = collections.deque(maxlen=wma_size)
+            self.confidence_history = collections.deque(maxlen=wma_size)
+        
+        # Add current values to history
+        self.lane_center_history.append(weighted_lane_center)
+        if hasattr(self, 'detection_confidence'):
+            self.confidence_history.append(self.detection_confidence)
+        else:
+            self.confidence_history.append(0.5)  # Default confidence
+        
+        # Calculate confidence-weighted moving average if we have history
+        if len(self.lane_center_history) > 0:
+            # Combine recency weights with confidence weights
+            recency_weights = np.arange(1, len(self.lane_center_history) + 1)
+            confidence_weights = np.array(list(self.confidence_history))
+            combined_weights = recency_weights * confidence_weights
+            
+            # Avoid division by zero
+            if np.sum(combined_weights) > 0:
+                lane_center_x = np.average(self.lane_center_history, weights=combined_weights)
+            else:
+                lane_center_x = self.lane_center_history[-1]  # Just use latest value
+        else:
+            lane_center_x = weighted_lane_center
+        
         vehicle_center_x = w / 2
-
-        # --- Visualization (using the chosen polynomials) ---
-        min_y = int(h * (3 / 5))
-        max_y = int(h)
-        left_x_start = int(poly_left_to_use(max_y))
-        left_x_end = int(poly_left_to_use(min_y))
-        right_x_start = int(poly_right_to_use(max_y))
-        right_x_end = int(poly_right_to_use(min_y))
         
-        # Determine line color for visualization: Green for new, Orange for recalled
-        line_color = [0, 255, 0] if lines_detected_this_frame else [255, 165, 0]
-
-        display = LaneKeepingAssist.draw_lines(
-                    frame,
-                    [[
-                        [left_x_start, max_y, left_x_end, min_y],
-                        [right_x_start, max_y, right_x_end, min_y],
-                    ]],
-                    color=line_color,
-                    thickness=5,
-                        )
-
-        # The error is the deviation from the center in pixels.
+        # --- Enhanced visualization with polynomial curves ---
+        # Create smoother curve visualization using the polynomial
+        min_y = int(h * 0.5)  # Extend higher up for better visibility
+        max_y = int(h)
+        
+        # Generate points for the curve
+        plot_y = np.linspace(min_y, max_y, num=20)
+        left_plot_x = poly_left_to_use(plot_y)
+        right_plot_x = poly_right_to_use(plot_y)
+        
+        # Convert to integer points for drawing
+        left_points = np.column_stack((left_plot_x.astype(np.int32), plot_y.astype(np.int32)))
+        right_points = np.column_stack((right_plot_x.astype(np.int32), plot_y.astype(np.int32)))
+        
+        # Create a copy of the frame for visualization
+        display = np.copy(frame)
+        
+        # Color based on detection confidence
+        confidence_color = None
+        if hasattr(self, 'detection_confidence'):
+            # Green for high confidence, yellow for medium, orange for low
+            if self.detection_confidence > 0.7:
+                confidence_color = [0, 255, 0]  # Green
+            elif self.detection_confidence > 0.4:
+                confidence_color = [0, 255, 255]  # Yellow
+            else:
+                confidence_color = [0, 165, 255]  # Orange
+        else:
+            confidence_color = [0, 255, 0] if lines_detected_this_frame else [0, 165, 255]
+        
+        # Draw the lane curves
+        cv2.polylines(display, [left_points], False, confidence_color, thickness=5)
+        cv2.polylines(display, [right_points], False, confidence_color, thickness=5)
+        
+        # Draw lane center and vehicle center for visualization
+        cv2.circle(display, (int(lane_center_x), int(h * 0.8)), 10, [0, 0, 255], -1)  # Lane center
+        cv2.circle(display, (int(vehicle_center_x), int(h * 0.8)), 10, [255, 0, 0], -1)  # Vehicle center
+        
+        # The error is the deviation from the center in pixels
         error = lane_center_x - vehicle_center_x
+        
+        # Scale correction based on confidence
+        confidence_factor = 1.0
+        if hasattr(self, 'detection_confidence'):
+            confidence_factor = self.detection_confidence
         
         # 4. Get Correction from the PID Controller
         current_value_for_pid = -error
-        steering_correction = self.pid_controller.update(current_value_for_pid)
+        raw_steering_correction = self.pid_controller.update(current_value_for_pid)
+        
+        # Apply confidence scaling - less confident = more conservative correction
+        steering_correction = raw_steering_correction * confidence_factor
+        
+        # Draw error text on display
+        cv2.putText(display, f"Error: {error:.1f}px", (30, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, [255, 255, 255], 2)
+        cv2.putText(display, f"Conf: {confidence_factor:.2f}", (30, 100), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, confidence_color, 2)
 
         return steering_correction, display
     
     @staticmethod
     def draw_lines(img, lines, color=[255, 0, 0], thickness=3):
+        """
+        Enhanced line drawing function that supports both straight lines and curves.
+        """
         line_img = np.zeros(
             (
                 img.shape[0],
@@ -376,11 +508,13 @@ class LaneKeepingAssist:
         )
         img = np.copy(img)
         if lines is None:
-            return
+            return img
+        
         for line in lines:
             for x1, y1, x2, y2 in line:
                 cv2.line(line_img, (x1, y1), (x2, y2), color, thickness)   
 
+        # Add semi-transparent overlay
         img = cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0)    
         return img
         
@@ -718,6 +852,8 @@ class MPCProcess(multiprocessing.Process):
                 with self._lka_output_lock:
                     self._lka_steering_correction_norm = 0.0
                 time.sleep(0.01) # Small sleep to prevent busy-waiting on error
+            if cv2.waitKey(1) & 0xFF == ord('q'): # Optional: add a way to quit
+                break
 
         print("MPC_Process: LKA Processing Thread stopping.")
         cv2.destroyAllWindows() # Close any open OpenCV windows
@@ -823,7 +959,7 @@ class MPCProcess(multiprocessing.Process):
 
 
         lka_enabled = False
-        lka_strength = 0.4 # Increased strength for better testing
+        lka_strength = 0.2 # Increased strength for better testing
         # Debugging counter
         frame_process_count = 0
         last_print_time = time.time()
@@ -982,39 +1118,22 @@ class MPCProcess(multiprocessing.Process):
                         # final_brake_cmd is already user_brake_request.
                         self.pid_speed_controller.reset() 
                         # self.current_applied_throttle_user was already reset.
-                    else: # No user braking, PID can influence.
-                        # Condition for PID to actively limit/control:
-                        # - If speed is over the target OR
-                        # - If speed is very close to target and user is still trying to accelerate OR
-                        # - If user is not providing throttle input (coasting) and speed needs adjustment by PID.
+                    else: # No user braking, PID acts as intelligent throttle assistant
+                        # PID Throttle Assistant Logic: Only controls throttle when user is actively accelerating
+                        # Acts as a speed limiter/assistant rather than cruise control
                         
-                        # Let PID primarily act if speed is above or very near the setpoint.
-                        if current_speed_mps > self.target_speed_mps: # Overspeeding
-                            final_throttle_cmd = 0.0 # Definitely cut throttle
-                            if pid_output < 0: # PID wants to brake
-                                final_brake_cmd = max(final_brake_cmd, np.clip(-pid_output, 0.0, 1.0))
-                            self.current_applied_throttle_user = 0.0 # Reflect that throttle is cut
+                        if user_throttle_request > 0:  # User is actively pressing throttle
+                            # Convert PID output to throttle command (clamp negative values to 0)
+                            pid_throttle_cmd = max(0.0, np.clip(pid_output, 0.0, 1.0))
                             
-                        elif current_speed_mps > self.target_speed_mps - 1.0: # Approaching limit (e.g., within 1 m/s)
-                            # If PID suggests throttling down or braking, respect that.
-                            if pid_output < user_throttle_request : # PID wants less throttle than user or wants to brake
-                                if pid_output >= 0: # PID wants some throttle, but less than user
-                                    final_throttle_cmd = np.clip(pid_output, 0.0, 1.0)
-                                else: # PID wants to brake
-                                    final_throttle_cmd = 0.0
-                                    final_brake_cmd = max(final_brake_cmd, np.clip(-pid_output, 0.0, 1.0))
-                                # Sync user ramp if PID is reducing throttle
-                                self.current_applied_throttle_user = final_throttle_cmd
-                        
-                        # If user is not accelerating (user_throttle_request is 0 or very low)
-                        # and speed is below target, PID can apply gentle throttle to maintain speed (e.g., uphill/downhill).
-                        # This prevents unwanted strong acceleration if user is just coasting.
-                        # elif user_throttle_request < 0.1 and current_speed_mps < self.target_speed_mps :
-                        #      if pid_output > 0: # PID wants to apply throttle to maintain speed
-                        #          # Apply only a small portion of PID's throttle if user isn't actively accelerating
-                        #          # This is to counteract drag/hills, not to aggressively accelerate.
-                        #          maintenance_throttle = np.clip(pid_output, 0.0, 0.3) # Max 30% throttle for maintenance
-                        #          final_throttle_cmd = max(final_throttle_cmd, maintenance_throttle) # Ensure it doesn't override user's small throttle
+                            # Use the minimum of user request and PID limit (PID acts as speed limiter)
+                            final_throttle_cmd = min(user_throttle_request, pid_throttle_cmd)
+                            
+                            # Sync user ramp to reflect the limited throttle
+                            self.current_applied_throttle_user = final_throttle_cmd
+                        else:
+                            # User not accelerating - no throttle assistance, let vehicle coast
+                            final_throttle_cmd = 0.0
                 
                 
                 # --- Handle Phone Disconnection / Stale Data (Overrides PID/User) ---
