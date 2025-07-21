@@ -705,9 +705,9 @@ class MPCProcess(multiprocessing.Process):
                     self._lka_steering_correction_norm = correction
                 
                 # Display the processed frame (optional, for debugging)
-                if display_frame is not None:
-                    cv2.imshow('LKA Lines', display_frame)
-                    cv2.waitKey(1) # Small delay to allow display update
+                # if display_frame is not None:
+                #     cv2.imshow('LKA Lines', display_frame)
+                #     cv2.waitKey(1) # Small delay to allow display update
 
             except queue.Empty:
                 continue # No image in queue, loop again
@@ -718,6 +718,8 @@ class MPCProcess(multiprocessing.Process):
                 with self._lka_output_lock:
                     self._lka_steering_correction_norm = 0.0
                 time.sleep(0.01) # Small sleep to prevent busy-waiting on error
+            if cv2.waitKey(1) & 0xFF == ord('q'): # Optional: add a way to quit
+                break
             if cv2.waitKey(1) & 0xFF == ord('q'): # Optional: add a way to quit
                 break
 
@@ -984,6 +986,22 @@ class MPCProcess(multiprocessing.Process):
                         # final_brake_cmd is already user_brake_request.
                         self.pid_speed_controller.reset() 
                         # self.current_applied_throttle_user was already reset.
+                    else: # No user braking, PID acts as intelligent throttle assistant
+                        # PID Throttle Assistant Logic: Only controls throttle when user is actively accelerating
+                        # Acts as a speed limiter/assistant rather than cruise control
+                        
+                        if user_throttle_request > 0:  # User is actively pressing throttle
+                            # Convert PID output to throttle command (clamp negative values to 0)
+                            pid_throttle_cmd = max(0.0, np.clip(pid_output, 0.0, 1.0))
+                            
+                            # Use the minimum of user request and PID limit (PID acts as speed limiter)
+                            final_throttle_cmd = min(user_throttle_request, pid_throttle_cmd)
+                            
+                            # Sync user ramp to reflect the limited throttle
+                            self.current_applied_throttle_user = final_throttle_cmd
+                        else:
+                            # User not accelerating - no throttle assistance, let vehicle coast
+                            final_throttle_cmd = 0.0
                     else: # No user braking, PID acts as intelligent throttle assistant
                         # PID Throttle Assistant Logic: Only controls throttle when user is actively accelerating
                         # Acts as a speed limiter/assistant rather than cruise control
