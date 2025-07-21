@@ -206,7 +206,7 @@ def vehicle_model(state, control_input, dt):
 
 
 class LaneKeepingAssist:
-    def __init__(self, dt, kp=0.1, ki=0.0008, kd=0.0001):
+    def __init__(self, dt, kp=0.002, ki=0.00001, kd=0.00008):
         """
         Initializes the LKA system using the generic PIDController.
         :param dt: The time step (delta time) for the PID derivative calculation.
@@ -718,6 +718,8 @@ class MPCProcess(multiprocessing.Process):
                 with self._lka_output_lock:
                     self._lka_steering_correction_norm = 0.0
                 time.sleep(0.01) # Small sleep to prevent busy-waiting on error
+            if cv2.waitKey(1) & 0xFF == ord('q'): # Optional: add a way to quit
+                break
 
         print("MPC_Process: LKA Processing Thread stopping.")
         cv2.destroyAllWindows() # Close any open OpenCV windows
@@ -823,7 +825,7 @@ class MPCProcess(multiprocessing.Process):
 
 
         lka_enabled = False
-        lka_strength = 0.4 # Increased strength for better testing
+        lka_strength = 0.2 # Reduced strength to minimize oscillation
         # Debugging counter
         frame_process_count = 0
         last_print_time = time.time()
@@ -894,7 +896,7 @@ class MPCProcess(multiprocessing.Process):
                 desired_steer_angle_rad = 0.0; desired_steer_rate_rps = 0.0
                 throttle_cmd = 0.0; brake_cmd = 0.0
 
-                if not is_phone_currently_connected or time.time() - last_phone_update_current > 2.0: # 2 second timeout for phone data
+                if not is_phone_currently_connected or time.time() - last_phone_update_current > 60.0: # 2 second timeout for phone data
                     if is_phone_currently_connected: # Was connected, now stale
                         print("MPC_Process: Phone data stale. Applying brakes.")
                         self._update_local_phone_sensor_data(0.0,0.0,0,0,reverse_active,False) # Update status internally
@@ -982,43 +984,26 @@ class MPCProcess(multiprocessing.Process):
                         # final_brake_cmd is already user_brake_request.
                         self.pid_speed_controller.reset() 
                         # self.current_applied_throttle_user was already reset.
-                    else: # No user braking, PID can influence.
-                        # Condition for PID to actively limit/control:
-                        # - If speed is over the target OR
-                        # - If speed is very close to target and user is still trying to accelerate OR
-                        # - If user is not providing throttle input (coasting) and speed needs adjustment by PID.
+                    else: # No user braking, PID acts as intelligent throttle assistant
+                        # PID Throttle Assistant Logic: Only controls throttle when user is actively accelerating
+                        # Acts as a speed limiter/assistant rather than cruise control
                         
-                        # Let PID primarily act if speed is above or very near the setpoint.
-                        if current_speed_mps > self.target_speed_mps: # Overspeeding
-                            final_throttle_cmd = 0.0 # Definitely cut throttle
-                            if pid_output < 0: # PID wants to brake
-                                final_brake_cmd = max(final_brake_cmd, np.clip(-pid_output, 0.0, 1.0))
-                            self.current_applied_throttle_user = 0.0 # Reflect that throttle is cut
+                        if user_throttle_request > 0:  # User is actively pressing throttle
+                            # Convert PID output to throttle command (clamp negative values to 0)
+                            pid_throttle_cmd = max(0.0, np.clip(pid_output, 0.0, 1.0))
                             
-                        elif current_speed_mps > self.target_speed_mps - 1.0: # Approaching limit (e.g., within 1 m/s)
-                            # If PID suggests throttling down or braking, respect that.
-                            if pid_output < user_throttle_request : # PID wants less throttle than user or wants to brake
-                                if pid_output >= 0: # PID wants some throttle, but less than user
-                                    final_throttle_cmd = np.clip(pid_output, 0.0, 1.0)
-                                else: # PID wants to brake
-                                    final_throttle_cmd = 0.0
-                                    final_brake_cmd = max(final_brake_cmd, np.clip(-pid_output, 0.0, 1.0))
-                                # Sync user ramp if PID is reducing throttle
-                                self.current_applied_throttle_user = final_throttle_cmd
-                        
-                        # If user is not accelerating (user_throttle_request is 0 or very low)
-                        # and speed is below target, PID can apply gentle throttle to maintain speed (e.g., uphill/downhill).
-                        # This prevents unwanted strong acceleration if user is just coasting.
-                        # elif user_throttle_request < 0.1 and current_speed_mps < self.target_speed_mps :
-                        #      if pid_output > 0: # PID wants to apply throttle to maintain speed
-                        #          # Apply only a small portion of PID's throttle if user isn't actively accelerating
-                        #          # This is to counteract drag/hills, not to aggressively accelerate.
-                        #          maintenance_throttle = np.clip(pid_output, 0.0, 0.3) # Max 30% throttle for maintenance
-                        #          final_throttle_cmd = max(final_throttle_cmd, maintenance_throttle) # Ensure it doesn't override user's small throttle
+                            # Use the minimum of user request and PID limit (PID acts as speed limiter)
+                            final_throttle_cmd = min(user_throttle_request, pid_throttle_cmd)
+                            
+                            # Sync user ramp to reflect the limited throttle
+                            self.current_applied_throttle_user = final_throttle_cmd
+                        else:
+                            # User not accelerating - no throttle assistance, let vehicle coast
+                            final_throttle_cmd = 0.0
                 
                 
                 # --- Handle Phone Disconnection / Stale Data (Overrides PID/User) ---
-                if not is_phone_currently_connected or time.time() - last_phone_update_current > 2.0:
+                if not is_phone_currently_connected or time.time() - last_phone_update_current > 60.0:
                     if is_phone_currently_connected: 
                         print("MPC_Process: Phone data stale. Applying emergency brakes.")
                         self._update_local_phone_sensor_data(0.0,0.0,0,0,reverse_active,False) 
